@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Brother HL-T4000DW CUPS driver provisioning for mileva and sparck, plus
   `setup.sh` queue bootstrap when the USB printer is connected.
 - OpenClaw home service autostart for mileva.
+### Fixed
+- `fleetctl exec` now reports a remote command killed by a signal as `128+N`
+  (143 for SIGTERM, 137 for SIGKILL, 130 for SIGINT), matching `sh` and `ssh`,
+  instead of the truncated `SystemExit` values 241/247 that read as unknown
+  signals; a missing remote command exits 127 and a non-executable one 126,
+  each with a one-line message rather than a Python traceback.
 ### Changed
 - Simplified the Emacs Org setup around a single `~/org/main.org` file,
   removing the multi-file inbox/project/metrics/deadline machinery, dynamic

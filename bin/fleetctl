@@ -224,13 +224,28 @@ import sys
 payload = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 env = os.environ.copy()
 env.update(payload.get("env", {}))
-completed = subprocess.run(
-    payload["argv"],
-    check=False,
-    cwd=payload.get("cwd") or None,
-    env=env,
-)
-raise SystemExit(completed.returncode)
+try:
+    completed = subprocess.run(
+        payload["argv"],
+        check=False,
+        cwd=payload.get("cwd") or None,
+        env=env,
+    )
+except FileNotFoundError as exc:
+    print(f"fleetctl exec: {exc.strerror}: {exc.filename}", file=sys.stderr)
+    raise SystemExit(127)
+except PermissionError as exc:
+    print(f"fleetctl exec: {exc.strerror}: {exc.filename}", file=sys.stderr)
+    raise SystemExit(126)
+code = completed.returncode
+# A child killed by a signal arrives here as a negative returncode, and a bare
+# `SystemExit(-15)` leaves through the exit-status truncation as 241 -- a number
+# every shell then reads as "killed by signal 113".  Re-encode it the way sh and
+# ssh report signal deaths, 128+N, so `$?` means the same thing on both ends of
+# the wire and scripts keying on 143/137 keep working.
+if code < 0:
+    code = 128 - code
+raise SystemExit(code)
 """
 
 EXEC_REMOTE_BOOTSTRAP = (
