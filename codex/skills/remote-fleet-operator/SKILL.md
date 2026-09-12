@@ -50,6 +50,17 @@ fleetctl protocol show <target-or-pool>
 fleetctl queue list <target-or-pool>
 ```
 
+## Site context
+
+For the user-provided **AMD GPU Cluster / MI210 Slurm site**, read
+[references/amd-gpu-cluster.md](references/amd-gpu-cluster.md) before preparing
+jobs or changing its protocol or queue configuration. It captures the supplied
+`AMD Server.pdf`, including mandatory Slurm submission, GPU-only queue usage,
+storage limits, and errors in the example scripts. Apply these site rules only
+when the user or private inventory identifies this cluster; an AMD GPU alone
+does not identify the site. The document's hardware and software descriptions
+are source context, not live availability or permission to change inventory.
+
 ## Preferred workflow
 
 1. Resolve context.

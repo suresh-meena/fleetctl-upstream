@@ -7,6 +7,11 @@ driving `ssh`, `scp` and `rsync` — no daemon, nothing installed on the remote.
 `fleetctl help` is the manual: `overview verbs roles reach capabilities config
 secrets jobs examples`. This page is the tour.
 
+For the supplied AMD MI210 cluster, the operator skill includes
+[AMD GPU cluster site context](../../codex/skills/remote-fleet-operator/references/amd-gpu-cluster.md)
+from `AMD Server.pdf`: Slurm policy, storage limits, hardware background, and
+corrections needed before using its example scripts.
+
 ## Why
 
 The fleet grows in variety faster than in size — a Raspberry Pi whose only job

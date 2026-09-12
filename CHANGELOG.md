@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Added
+- AMD GPU cluster context from the supplied `AMD Server.pdf`, linked from the
+  fleet operator skill and fleetctl guide, with Slurm rules and source errata.
 - `fleetctl`, a private XDG-based fleet inventory and remote execution helper with host-level target workdirs, project bindings, SSH alias import, env migration, sync, script, submit, and doctor flows
 - Global Codex fleet instructions and a `remote-fleet-operator` skill for routing remote work through `fleetctl`
 - Emacs daemon service configuration for mileva and sparck machines
