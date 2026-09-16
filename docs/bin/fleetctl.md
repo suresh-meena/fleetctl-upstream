@@ -190,6 +190,7 @@ fleetctl smoke <target>                            # transport, then workdir
 fleetctl exec <target> -- python3 -c 'print(1)'    # after `--` is verbatim
 fleetctl script ./setup.sh --target <target> -- --flag value
 fleetctl sync push .                               # from a bound directory
+fleetctl sync transfer gpu1:~/data gpu2:~/data     # peer-to-peer, relay fallback
 fleetctl submit train.sh --target <target> --queue <preset>
 fleetctl jobs                                      # what you have submitted
 fleetctl job status <id>                           # target from the ledger
@@ -232,6 +233,18 @@ target's own workdir, or any pull, without `--force`.
 `sync` compresses at level 1 rather than rsync's default 6, because a transfer
 multiplexed through a Raspberry Pi is bound by the compressor, not the link.
 `--compress-level 0` turns compression off for a fast local hop.
+
+`sync transfer <src>[:<path>] <dst>[:<path>]` moves a tree between two targets
+instead of through this one: rsync runs on the source and reaches the
+destination over one ssh hop authenticated by this machine's forwarded agent,
+with the destination's host key learned accept-new against the source's own
+known_hosts. When that peer path cannot run — the destination wants a password,
+the source sees no route to it, no rsync on the source, no key the destination
+accepts — the transfer falls back to the relay `push`+`pull` already expressed,
+staging through a private local temp directory. `--relay` skips the peer
+attempt; `--no-fallback` refuses the relay. Both endpoints are admitted as
+`sync` (so a bridge endpoint needs `--admin`), paths default to the resolved
+project root, and `--delete` is guarded against the destination as a push's is.
 
 `submit` wraps your script in a scheduler preamble built from the queue preset;
 `--native-batch` sends your file unchanged instead. Nothing is submitted unless

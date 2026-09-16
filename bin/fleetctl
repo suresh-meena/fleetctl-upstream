@@ -63,6 +63,23 @@ DEFAULT_SYNC_EXCLUDES = [
 DEFAULT_SYNC_COMPRESS_LEVEL = 1
 MAX_SYNC_COMPRESS_LEVEL = 9
 
+# The ssh a `sync transfer` peer hop rides: from the source target to the
+# destination, run by the source's own rsync.  Deliberately minimal, because
+# the fleet's settings for that leg live on this machine and cannot move -- an
+# identity file is a local path, and a private known_hosts would have to be
+# shipped.  Batch mode so an unanswerable prompt fails fast into the relay
+# instead of hanging, accept-new as the same first-contact posture fleetctl
+# itself defaults to, now against the source's own known_hosts.
+PEER_HOP_CONNECT_TIMEOUT = 10
+PEER_HOP_SSH_OPTIONS = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    f"ConnectTimeout={PEER_HOP_CONNECT_TIMEOUT}",
+)
+
 # ---- SECTION: admission policy ---------------------------------------------
 #
 # What may be done to a machine is decided by its `role`, and by nothing else.
@@ -110,7 +127,7 @@ VERB_SUMMARY = {
     "ssh": "open an interactive session",
     "exec": "run one command, your argv preserved",
     "script": "stage a local script and run it there",
-    "sync": "push or pull a directory with rsync",
+    "sync": "push or pull a directory with rsync, or move it between two targets",
     "submit": "hand a script to the site's scheduler",
     "job": "status, logs and cancel for a submitted job",
 }
@@ -6893,7 +6910,7 @@ def command_script(args: argparse.Namespace, context: FleetContext) -> int:
 
 
 def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
-    """Push or pull files with rsync."""
+    """Push, pull or transfer files with rsync."""
     level = args.compress_level
     if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
         raise FleetError(
@@ -6901,6 +6918,8 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
             "0 turns compression off; the range holds for zlib and zstd alike, "
             "so the level stays valid whichever rsync negotiates."
         )
+    if args.direction == "transfer":
+        return command_sync_transfer(args, context, level=level)
     plan = build_plan(context, args, "sync")
     target = plan.target
     secret = plan.secret
@@ -6994,6 +7013,409 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
 
     completed = run_command(command, env=ssh_env(secret))
     return completed.returncode
+
+
+def parse_transfer_endpoint(value: str, *, what: str) -> tuple[str, str | None]:
+    """Parse one `sync transfer` endpoint: `<target>[:<path>]`.
+
+    Split on the first colon, the scp convention.  A `fleet:` prefix is stripped
+    before the split, which is what keeps `fleet:gpu1:/src` from reading as
+    target `fleet` with a path of `gpu1:/src`.
+    """
+    spec = value
+    if spec.startswith("fleet:"):
+        spec = spec[len("fleet:") :]
+    name, _, path = spec.partition(":")
+    name = name.strip()
+    if not name:
+        raise FleetError(
+            f"the {what} {value!r} names no target; an endpoint is <target>[:<path>]"
+        )
+    return name, (path.strip() or None)
+
+
+def transfer_endpoint_plan(
+    context: FleetContext, args: argparse.Namespace, selector: str
+) -> Plan:
+    """Build one endpoint's plan against a copy of ARGS, selector swapped in."""
+    one = argparse.Namespace(**vars(args))
+    one.selector = selector
+    return build_plan(context, one, "sync")
+
+
+def resolve_transfer_path(plan: Plan, raw: str | None, *, what: str) -> str:
+    """Resolve one endpoint's path the way `push`/`pull` resolve theirs.
+
+    A path that resolves to nothing is refused here, but a path that merely
+    *is* a root ("/") is not: `--delete` owns that refusal, and it has the
+    better message.
+    """
+    resolved = resolve_remote_path(raw, base=plan.cwd) if raw else plan.cwd
+    if not resolved:
+        raise FleetError(
+            f"no remote path for the {what} {plan.target.name!r}: the target defines "
+            "no `workdir` and the current directory has no project binding. Name a "
+            "path in the endpoint, set `workdir` on the target, or run "
+            "`fleetctl project bind`."
+        )
+    return resolved
+
+
+def peer_hop_transport(dest_secret: FleetSecret) -> str:
+    """The `-e` ssh string the source's rsync rides to the destination."""
+    return shlex.join(["ssh", "-p", str(dest_secret.port), *PEER_HOP_SSH_OPTIONS])
+
+
+def peer_probe_command(dest_secret: FleetSecret, dest_path: str) -> str:
+    """One ssh from the source that mkdirs the destination directory.
+
+    Doubles as the probe of the peer path before any data moves: auth, route
+    and write permission are all settled by a command too cheap to care about,
+    so a peer path that cannot work costs one round trip, not half a transfer.
+    The `mkdir` travels as a single quoted argument -- the destination's shell
+    must be the one to expand `$HOME`/`~`, not the source's.
+    """
+    parts = ["ssh", "-p", str(dest_secret.port), *PEER_HOP_SSH_OPTIONS]
+    return (
+        shlex.join(parts + [dest_secret.target])
+        + " "
+        + shlex.quote("mkdir -p " + quote_remote_path(dest_path))
+    )
+
+
+def peer_rsync_command(
+    dest_secret: FleetSecret,
+    source_path: str,
+    dest_path: str,
+    *,
+    level: int,
+    delete: bool,
+    excludes: Iterable[str],
+) -> str:
+    """The rsync that runs ON the source, pushing to the destination.
+
+    Shaped as the inner string of a `/bin/sh -c` rather than as an argv, because
+    the source path needs `quote_remote_path`'s unquoted `$HOME` prefix to
+    expand on the source while the destination spec must stay quoted until the
+    destination's own shell opens it.  The trailing slash on the reading side
+    carries the contents convention, exactly as `push` shapes its two ends.
+    """
+    parts = ["rsync", "-a"]
+    if level:
+        parts += ["-z", f"--compress-level={level}"]
+    if delete:
+        parts.append("--delete")
+    for pattern in excludes:
+        parts += ["--exclude", pattern]
+    parts += ["-e", peer_hop_transport(dest_secret)]
+    dest_spec = f"{dest_secret.target}:{dest_path}"
+    return f"{shlex.join(parts)} {quote_remote_path(source_path)}/ {shlex.quote(dest_spec)}"
+
+
+def run_peer_transfer(
+    source_plan: Plan,
+    dest_plan: Plan,
+    source_path: str,
+    dest_path: str,
+    *,
+    level: int,
+    delete: bool,
+    excludes: Iterable[str],
+) -> int:
+    """Run rsync on the source, reaching the destination over one ssh hop.
+
+    The hop is authenticated by this machine's agent, forwarded over a
+    dedicated connection: OpenSSH will not grant a session agent forwarding its
+    master never had, and a master established without `-A` is exactly what any
+    earlier verb left behind, so the driving ssh drops multiplexing for this
+    one command.  Route selection still rides the plan, so the bridge and the
+    fallback behave as they do for every other verb.  What cannot be
+    reproduced on the far leg -- the destination's identity file is a local
+    path, its password is never shipped -- is exactly what the relay fallback
+    is for, so every failure here is a reason, not a dead end.
+    """
+    dest_secret = dest_plan.secret
+    if dest_secret.auth == "password":
+        raise FleetError(
+            f"destination {dest_plan.target.name!r} authenticates with a password, "
+            "which the peer transfer cannot offer without shipping it"
+        )
+    source_secret = replace(source_plan.secret, forward_agent=True)
+    established = source_plan.connect()
+    runtime = {**established, "control_path": None}
+    probe = run_ssh_command(
+        source_secret,
+        allocate_tty=False,
+        remote_command=shlex.join(
+            ["/bin/sh", "-c", peer_probe_command(dest_secret, dest_path)]
+        ),
+        capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
+        **runtime,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or "").strip().splitlines()
+        raise FleetError(
+            f"destination {dest_plan.target.name!r} did not answer the source "
+            f"{source_plan.target.name!r} over ssh: "
+            + (detail[-1] if detail else f"the probe exited {probe.returncode}"),
+            exit_code=probe.returncode or SSH_TRANSPORT_FAILURE,
+        )
+    completed = run_ssh_command(
+        source_secret,
+        allocate_tty=False,
+        remote_command=shlex.join(
+            [
+                "/bin/sh",
+                "-c",
+                peer_rsync_command(
+                    dest_secret,
+                    source_path,
+                    dest_path,
+                    level=level,
+                    delete=delete,
+                    excludes=excludes,
+                ),
+            ]
+        ),
+        **runtime,
+    )
+    if completed.returncode != 0:
+        raise FleetError(
+            f"peer rsync exited {completed.returncode} on "
+            f"{source_plan.target.name!r}",
+            exit_code=completed.returncode,
+        )
+    return 0
+
+
+def run_relay_transfer(
+    source_plan: Plan,
+    dest_plan: Plan,
+    source_path: str,
+    dest_path: str,
+    *,
+    level: int,
+    delete: bool,
+    excludes: Iterable[str],
+) -> int:
+    """Pull into a private local staging directory, then push: the relay.
+
+    Two exact halves -- each is the `pull` and the `push` sync already ran, over
+    this machine's own fleet connections -- so it works wherever the peer path
+    cannot.  The price is the design, not an accident: every byte crosses this
+    machine once in each direction, and the whole tree sits in a local temp
+    directory for the duration.  `--no-fallback` is how you refuse that, and a
+    pull that fails leaves nothing behind but the staging directory itself.
+    """
+    with tempfile.TemporaryDirectory(prefix="fleetctl-transfer-") as staging:
+        source_secret = source_plan.secret
+        source_runtime = source_plan.connect()
+        pull = ["rsync", "-a"]
+        if level:
+            pull += ["-z", f"--compress-level={level}"]
+        for pattern in excludes:
+            pull += ["--exclude", pattern]
+        pull += [
+            "-e",
+            build_rsync_transport(source_secret, **source_runtime),
+            f"{source_secret.target}:{source_path.rstrip('/')}/",
+            staging,
+        ]
+        completed = run_command(pull, env=ssh_env(source_secret))
+        if completed.returncode != 0:
+            return completed.returncode
+
+        dest_secret = dest_plan.secret
+        dest_runtime = dest_plan.connect()
+        remote_parent = posixpath.dirname(dest_path.rstrip("/")) or "."
+        mkdir = run_ssh_command(
+            dest_secret,
+            allocate_tty=False,
+            remote_command=remote_shell_path_command(["mkdir", "-p"], remote_parent),
+            timeout=CONTROL_COMMAND_TIMEOUT,
+            **dest_runtime,
+        )
+        if mkdir.returncode != 0:
+            raise FleetError(
+                f"failed to create remote parent path {remote_parent!r} on "
+                f"{dest_plan.target.name!r}"
+            )
+        push = ["rsync", "-a"]
+        if level:
+            push += ["-z", f"--compress-level={level}"]
+        if delete:
+            push.append("--delete")
+        for pattern in excludes:
+            push += ["--exclude", pattern]
+        push += [
+            "-e",
+            build_rsync_transport(dest_secret, **dest_runtime),
+            staging.rstrip("/") + "/",
+            f"{dest_secret.target}:{dest_path}",
+        ]
+        completed = run_command(push, env=ssh_env(dest_secret))
+        return completed.returncode
+
+
+def report_transfer_plan(
+    source_plan: Plan,
+    dest_plan: Plan,
+    args: argparse.Namespace,
+    *,
+    source_path: str,
+    dest_path: str,
+    level: int,
+    excludes: list[str],
+) -> int:
+    """Print both endpoints' plans and both methods' commands, and do nothing.
+
+    Local resolution only, for both methods.  Unlike `sync push`, whose dry run
+    hands rsync itself a `--dry-run`, an honest peer dry run would have to open
+    the source-to-destination ssh -- recording the destination's host key on the
+    source before any data moved -- and the relay's push half only means
+    something after a real pull.  Hosts and users stay placeholders: the plan
+    describes the run without unlocking a pass-backed secret to name it.
+    """
+    parts = ["rsync", "-a"]
+    if level:
+        parts += ["-z", f"--compress-level={level}"]
+    if args.delete:
+        parts.append("--delete")
+    for pattern in excludes:
+        parts += ["--exclude", pattern]
+    # A plain interpolation rather than shlex.join: `<port>` is a placeholder,
+    # and quoting it produces a hop string nobody can read past.
+    hop = "ssh -p <port> " + " ".join(PEER_HOP_SSH_OPTIONS)
+    peer_command = (
+        shlex.join(parts + ["-e", hop])
+        + f" {quote_remote_path(source_path)}/ "
+        + shlex.quote(f"<dest-user>@<dest-host>:{dest_path}")
+    )
+    relay_pull = (
+        shlex.join(parts + ["-e", "ssh -p <port>"])
+        + f" <source-user>@<source-host>:{source_path.rstrip('/')}/"
+        + " <staging>"
+    )
+    relay_push = (
+        shlex.join(parts + ["-e", "ssh -p <port>"])
+        + " <staging>/"
+        + f" {shlex.quote(f'<dest-user>@<dest-host>:{dest_path}')}"
+    )
+    payload = {
+        "verb": "sync transfer",
+        "method": (
+            "relay"
+            if args.relay
+            else "peer, falling back to the relay"
+        )
+        + ("; the relay is refused by --no-fallback" if args.no_fallback else ""),
+        "source": {
+            "target": source_plan.target.name,
+            "role": resolve_role(source_plan.target, source_plan.protocol),
+            "routes": list(source_plan.routes),
+            "path": source_path,
+        },
+        "destination": {
+            "target": dest_plan.target.name,
+            "role": resolve_role(dest_plan.target, dest_plan.protocol),
+            "routes": list(dest_plan.routes),
+            "path": dest_path,
+        },
+        "delete": bool(args.delete),
+        "compress_level": level,
+        "excludes": excludes,
+        "peer_command": None if args.relay else peer_command,
+        "relay_pull": relay_pull,
+        "relay_push": relay_push,
+    }
+    emit(payload, as_json=bool(getattr(args, "json", False)))
+    return 0
+
+
+def command_sync_transfer(
+    args: argparse.Namespace, context: FleetContext, *, level: int
+) -> int:
+    """Move a tree between two targets: peer-to-peer first, relay as fallback."""
+    if args.selector:
+        raise FleetError(
+            "`sync transfer` names both endpoints positionally as "
+            "<target>[:<path>]; --target names one"
+        )
+    if not args.remote_path:
+        raise FleetError(
+            "`sync transfer` takes two endpoints: <source-target>[:<path>] "
+            "<destination-target>[:<path>]"
+        )
+    source_name, source_raw = parse_transfer_endpoint(args.local_path, what="source")
+    dest_name, dest_raw = parse_transfer_endpoint(args.remote_path, what="destination")
+    source_plan = transfer_endpoint_plan(context, args, source_name)
+    # The destination plan is built against ARGS itself rather than a copy, so
+    # the audit line records the endpoint that gets written to.
+    args.selector = dest_name
+    dest_plan = build_plan(context, args, "sync")
+    if source_plan.target.name == dest_plan.target.name:
+        raise FleetError(
+            "source and destination both resolve to "
+            f"{dest_plan.target.name!r}; a transfer needs two different targets"
+        )
+    source_path = resolve_transfer_path(source_plan, source_raw, what="source")
+    dest_path = resolve_transfer_path(dest_plan, dest_raw, what="destination")
+    if args.delete:
+        # The destination is written exactly as a push writes it, so it earns
+        # the push reading of the --delete guard, --force included.
+        ensure_sync_delete_allowed(
+            dest_path, dest_plan.target, direction="push", force=bool(args.force)
+        )
+    binding = dest_plan.binding or source_plan.binding
+    excludes = list(DEFAULT_SYNC_EXCLUDES)
+    if binding is not None:
+        excludes.extend(binding.sync_excludes)
+
+    if args.dry_run:
+        return report_transfer_plan(
+            source_plan,
+            dest_plan,
+            args,
+            source_path=source_path,
+            dest_path=dest_path,
+            level=level,
+            excludes=excludes,
+        )
+
+    if not args.relay:
+        try:
+            return run_peer_transfer(
+                source_plan,
+                dest_plan,
+                source_path,
+                dest_path,
+                level=level,
+                delete=bool(args.delete),
+                excludes=excludes,
+            )
+        except FleetError as error:
+            if args.no_fallback:
+                raise
+            print(
+                f"note: peer transfer did not run ({error}); routing through this "
+                "machine instead (--relay skips the peer attempt)",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            "note: --relay: routing through this machine rather than peer-to-peer",
+            file=sys.stderr,
+        )
+    return run_relay_transfer(
+        source_plan,
+        dest_plan,
+        source_path,
+        dest_path,
+        level=level,
+        delete=bool(args.delete),
+        excludes=excludes,
+    )
 
 
 def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
@@ -7881,6 +8303,7 @@ SYNOPSIS
     fleetctl exec <target> [--tty] [--dry-run] -- <argv>...
     fleetctl script <file> --target <target> [--interpreter <cmd>]
     fleetctl sync push|pull <local> [<remote>] [--delete] [--force]
+    fleetctl sync transfer <src>[:<path>] <dst>[:<path>] [--relay]
     fleetctl submit <file> [--queue <preset>] [--native-batch]
 
 ADMISSION VERBS
@@ -7927,6 +8350,28 @@ FAN-OUT
     `exec` on a login node is the line most worth having. No flag
     value and nothing after `--` is recorded at all, because that is
     where a pasted token would be.
+
+TARGET-TO-TARGET
+    `sync transfer <src>[:<path>] <dst>[:<path>]` moves a tree between
+    two fleet targets. Both endpoints resolve like any selector -- a
+    target, or a pool's first enabled member -- with the path
+    defaulting to the resolved project root, and both are admitted as
+    `sync`, so a bridge endpoint needs --admin. The peer path runs
+    rsync ON the source, reaching the destination over one ssh hop
+    authenticated by this machine's forwarded agent; the destination's
+    host key is learned with the same accept-new posture fleetctl
+    itself defaults to, against the source's own known_hosts. When the
+    peer path cannot run -- the destination wants a password, the
+    source sees no route to it, no rsync on the source, no key the
+    destination accepts -- the transfer falls back to the relay the
+    two halves of sync already expressed: pull into a private local
+    staging directory, then push. The relay is exact but moves every
+    byte through this machine twice and needs local disk for the whole
+    tree. --relay takes the relay without trying the peer path;
+    --no-fallback refuses the relay, on top of pinning each endpoint's
+    reach to its first declared route. --delete is guarded against the
+    destination exactly as a push's is. A dry run prints both plans
+    and both methods' commands, claiming nothing about remote state.
 
 EVERYTHING ELSE
     Inventory   jobs, list, show, explain, resolve, protocol show,
@@ -8417,6 +8862,10 @@ DESCRIPTION
         cd <project> && fleetctl project bind --target <target>
         fleetctl sync push .
         fleetctl exec -- python3 --version
+
+    Move a tree between two targets without staging it by hand:
+        fleetctl sync transfer gpu1:~/data/runs gpu2:~/data/runs
+        fleetctl sync transfer gpu1 gpu2 --relay    # this machine stages it
 
     Run a local script with arguments; after `--` is verbatim:
         fleetctl script ./setup.sh --target <target> -- --flag value
@@ -8971,15 +9420,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     script_parser.set_defaults(handler=command_script)
 
-    sync_parser = subparsers.add_parser("sync", help="Push or pull files with rsync")
-    sync_parser.add_argument("direction", choices=["push", "pull"])
-    sync_parser.add_argument("local_path", help="Local source or destination path")
+    sync_parser = subparsers.add_parser(
+        "sync", help="Push, pull or transfer files with rsync"
+    )
+    sync_parser.add_argument(
+        "direction",
+        choices=["push", "pull", "transfer"],
+        help=(
+            "push/pull move data between this machine and one target; transfer "
+            "moves it between two targets"
+        ),
+    )
+    sync_parser.add_argument(
+        "local_path",
+        help=(
+            "Local source or destination path (push/pull), or the source "
+            "endpoint <target>[:<path>] (transfer)"
+        ),
+    )
     sync_parser.add_argument(
         "remote_path",
         nargs="?",
-        help="Remote source or destination path (defaults to target/project root)",
+        help=(
+            "Remote source or destination path, defaulting to the target/project "
+            "root (push/pull), or the destination endpoint <target>[:<path>] "
+            "(transfer, where it is required)"
+        ),
     )
     sync_parser.add_argument("--target", dest="selector", help="Target or pool name")
+    sync_parser.add_argument(
+        "--relay",
+        action="store_true",
+        help=(
+            "transfer: skip the peer-to-peer attempt and stage through this machine"
+        ),
+    )
     sync_parser.add_argument(
         "--delete",
         action="store_true",
