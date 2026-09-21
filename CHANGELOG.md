@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Added
+- `fleetctl preflight <script> --target <target>`: an offline `#SBATCH`
+  checker that reports what the scheduler would reject, with a stable rule ID
+  per finding (`SH*` shell, `SLURM*` generic semantics, `FS*`, `MOD*`, and the
+  site's own `rule_prefix`, e.g. `KIAC023`). `submit` runs it before opening a
+  connection and refuses on ERROR; `--no-preflight` skips it and `--strict`
+  lets a warning refuse too. Exit 0 clean, 1 warnings, 2 refused. Ported from
+  the standalone `slurm-helper` skill, which this replaces.
+- Site policy as declared config, so the preflight can enforce what
+  `sbatch --test-only` will not: per queue, `max_time`, `allowed_accounts`,
+  `denied_accounts`, `required_qos`, `account_required`, `gres_types`,
+  `gpu_only`, `nodes`, plus `evidence` and `as_of`; per protocol,
+  `gpu_vendor`, `preferred_storage`, `home_prefix`, `storage_caveat` and
+  `rule_prefix`. A dry run accepts an account the partition forbids and the
+  job then pends forever, so the matrix is checked locally from data rather
+  than left to the scheduler to reveal later.
+- `doctor` now warns when a queue claiming `verified-by-run`/`verified-live`
+  has no `as_of`, an unreadable one, or one older than 180 days -- so
+  "verified" cannot quietly decay into "was true once".
 - `fleetctl sync transfer <src>[:<path>] <dst>[:<path>]`: target-to-target
   rsync that runs on the source and reaches the destination over one
   agent-forwarded ssh hop, falling back to the local pull-then-push relay when

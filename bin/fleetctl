@@ -445,6 +445,29 @@ class QueueRecord:
     constraint: str | None = None
     extra_directives: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    # The scheduler's own MaxTime for this partition, as opposed to `time_limit`
+    # above, which is the duration this preset asks for.  Exceeding it is not a
+    # slow job, it is a rejected one, so `preflight` can catch it offline.
+    max_time: str | None = None
+    # The account/QOS matrix.  `sbatch --test-only` accepts a request the
+    # scheduler will never run -- an account not permitted on a partition
+    # passes the dry run and the job then pends forever with the reason buried
+    # in `squeue`.  Declaring the matrix is what lets the preflight say so
+    # before the job is queued rather than after it has sat for a day.
+    allowed_accounts: tuple[str, ...] = ()
+    denied_accounts: tuple[str, ...] = ()
+    required_qos: str | None = None
+    account_required: bool = False
+    # GRES types the partition actually offers, e.g. ("a6000",).  A generic
+    # `--gres=gpu:1` gets whatever the node has; naming a type the partition
+    # does not have is the same forever-pending failure as a bad account.
+    gres_types: tuple[str, ...] = ()
+    # A GPU queue that sites monitor for CPU-only jobs, and block accounts over.
+    gpu_only: bool = False
+    # Slurm hostlists naming this partition's nodes, e.g. ("cn[7-9]",).
+    nodes: tuple[str, ...] = ()
+    evidence: str | None = None
+    as_of: str | None = None
     # What the scheduler allocates here, as opposed to what the login node has.
     # A site's GPUs live on compute nodes behind the surface you SSH to, so
     # without this `--require vram_gb>=64` would refuse the one target in the
@@ -466,6 +489,19 @@ class ProtocolRecord:
     docs: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     queues: tuple[QueueRecord, ...] = ()
+    # Site facts `preflight` checks a batch script against.  `gpu_vendor` is
+    # here because the tooling differs and the wrong one is silent: `nvidia-smi`
+    # on an MI210 node does not fail usefully, it just reports nothing while the
+    # job burns its walltime.  The storage fields carry the same kind of trap --
+    # a scratch tree that is purged weekly looks exactly like a durable one
+    # until the week turns over.
+    gpu_vendor: str | None = None
+    preferred_storage: str | None = None
+    home_prefix: str | None = None
+    storage_caveat: str | None = None
+    # Prefix for this site's preflight rule IDs, e.g. "KIAC" -> KIAC023.  A
+    # stable ID is what makes a diagnostic searchable and a waiver specific.
+    rule_prefix: str | None = None
 
     def default_queue(self) -> QueueRecord | None:
         """Return the preferred queue for this protocol."""
@@ -1477,6 +1513,1730 @@ def probe_remote_argv(plan: Plan) -> list[str]:
     return ["/usr/bin/env", "bash", "-lc", body]
 
 
+# ---- SECTION: slurm preflight ----------------------------------------------
+#
+# Offline checking of an #SBATCH batch script before it is ever staged to a
+# target: parse the directives, apply Slurm's own generic semantics, then --
+# only for a protocol whose `kind` is "slurm" -- the submitting site's own
+# policy, read off the ProtocolRecord/QueueRecord the fleet config already
+# declares.  Nothing in this section touches the network or a remote host;
+# that is the whole point of running it before `sync`/`submit` rather than
+# after.  It is ported from a standalone `kiac_slurm` checker that read a
+# separate YAML site file -- that file's per-cluster facts (partitions,
+# account/QOS matrices, GRES types, storage policy) now live as fields on
+# ProtocolRecord/QueueRecord instead, so the same rules run for any site a
+# fleet target names, not just the one the original tool was written for.
+#
+# Every finding is a Diagnostic with a rule ID (SH* shell, SLURM* generic
+# semantics, FS* filesystem, MOD* modules, or the protocol's own
+# `rule_prefix` for site policy, e.g. KIAC023) and, where the claim depends
+# on how well the underlying fact is known, a confidence label:
+#
+#   verified-by-run    a real submission proved this fact
+#   verified-live      read from the live scheduler this session
+#   documented         stated by site documentation, uncontested
+#   document-conflict  the documentation contradicts itself; unresolved
+#   inferred           a default or heuristic, not a site fact
+#
+# The load-bearing trap this whole section exists to catch offline: Slurm
+# stops reading #SBATCH directives at the first non-comment, non-blank line,
+# so anything after it is silently ignored (SLURM011) -- and separately,
+# `sbatch --test-only` validates syntax and resource shape but does **not**
+# enforce account-partition or QOS policy, so a request from a disallowed
+# account passes the dry run cleanly and then pends forever in the real
+# queue.  That second trap is why account/QOS policy is enforced here from
+# declared data rather than left for a dry run to catch -- the dry run can't.
+
+CONF_VERIFIED_BY_RUN = "verified-by-run"
+CONF_VERIFIED_LIVE = "verified-live"
+CONF_DOCUMENTED = "documented"
+CONF_CONFLICT = "document-conflict"
+CONF_INFERRED = "inferred"
+
+LEVEL_PASS = "PASS"
+LEVEL_INFO = "INFO"
+LEVEL_WARN = "WARN"
+LEVEL_ERROR = "ERROR"
+
+_LEVEL_RANK = {LEVEL_PASS: 0, LEVEL_INFO: 1, LEVEL_WARN: 2, LEVEL_ERROR: 3}
+
+
+# ---------------------------------------------------------------------------
+# Part 1: diagnostics and the report container
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Diagnostic:
+    """One finding.
+
+    `confidence` describes how well the underlying *fact* is known, not how
+    sure the tool is about its own logic -- an ERROR built on `documented`
+    means something different from one built on `verified-by-run`, and a
+    reader deciding whether to argue with a refusal needs to see which.
+    """
+
+    level: str
+    rule_id: str
+    message: str
+    line: int | None = None
+    excerpt: str | None = None
+    suggestion: str | None = None
+    confidence: str | None = None
+    escalated: bool = False
+
+
+@dataclass
+class Report:
+    """Ordered container of diagnostics; exit code and rendering derive from it."""
+
+    items: list[Diagnostic] = field(default_factory=list)
+
+    def add(
+        self,
+        level: str,
+        rule_id: str,
+        message: str,
+        *,
+        line: int | None = None,
+        excerpt: str | None = None,
+        suggestion: str | None = None,
+        confidence: str | None = None,
+    ) -> Diagnostic:
+        diag = Diagnostic(
+            level=level,
+            rule_id=rule_id,
+            message=message,
+            line=line,
+            excerpt=excerpt,
+            suggestion=suggestion,
+            confidence=confidence,
+        )
+        self.items.append(diag)
+        return diag
+
+    def pass_(self, rule_id: str, message: str, **kw: Any) -> Diagnostic:
+        return self.add(LEVEL_PASS, rule_id, message, **kw)
+
+    def info(self, rule_id: str, message: str, **kw: Any) -> Diagnostic:
+        return self.add(LEVEL_INFO, rule_id, message, **kw)
+
+    def warn(self, rule_id: str, message: str, **kw: Any) -> Diagnostic:
+        return self.add(LEVEL_WARN, rule_id, message, **kw)
+
+    def error(self, rule_id: str, message: str, **kw: Any) -> Diagnostic:
+        return self.add(LEVEL_ERROR, rule_id, message, **kw)
+
+    def _with_level(self, level: str) -> list[Diagnostic]:
+        return [d for d in self.items if d.level == level]
+
+    @property
+    def errors(self) -> list[Diagnostic]:
+        return self._with_level(LEVEL_ERROR)
+
+    @property
+    def warnings(self) -> list[Diagnostic]:
+        return self._with_level(LEVEL_WARN)
+
+    @property
+    def passes(self) -> list[Diagnostic]:
+        return self._with_level(LEVEL_PASS)
+
+    def escalate_warnings(self) -> int:
+        """Strict mode: promote every WARN to ERROR, in place.
+
+        Some callers (a CI gate, an unattended submit) want advice to be a
+        hard stop instead of something ship-past-able.  Escalating in place
+        rather than re-adding keeps each diagnostic's rule ID and message
+        intact, so a promoted finding is still traceable to the rule that
+        raised it -- `escalated` just says strict mode is why it is ERROR.
+        """
+        count = 0
+        for diag in self.items:
+            if diag.level == LEVEL_WARN:
+                diag.level = LEVEL_ERROR
+                diag.escalated = True
+                count += 1
+        return count
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "pass": len(self.passes),
+            "info": len(self._with_level(LEVEL_INFO)),
+            "warn": len(self.warnings),
+            "error": len(self.errors),
+        }
+
+    def worst_level(self) -> str:
+        """The single most severe level present, or PASS for an empty/clean report."""
+        if not self.items:
+            return LEVEL_PASS
+        return max(self.items, key=lambda d: _LEVEL_RANK[d.level]).level
+
+    def exit_code(self) -> int:
+        """0 clean, 1 warnings, 2 error/refusal.
+
+        fleetctl's own FleetError defaults to exit code 2, so an ERROR-level
+        report shares that status by design: both mean "do not proceed with
+        this as written," whether the tool is refusing outright or a rule
+        inside a report is.
+        """
+        if self.errors:
+            return 2
+        if self.warnings:
+            return 1
+        return 0
+
+    def rule_ids(self) -> list[str]:
+        return [d.rule_id for d in self.items]
+
+
+def _render_diagnostic_lines(diag: Diagnostic) -> list[str]:
+    simple = (
+        diag.excerpt is None
+        and diag.suggestion is None
+        and diag.confidence is None
+        and "\n" not in diag.message
+        and not diag.escalated
+    )
+    head = f"{diag.level:<5} {diag.rule_id:<7}"
+    if simple:
+        return [f"{head} {diag.message}".rstrip()]
+    if diag.line is not None:
+        head += f" line {diag.line}"
+    if diag.escalated:
+        head += "  (strict)"
+    lines = [head.rstrip()]
+    if diag.excerpt:
+        lines.append(f"      {diag.excerpt}")
+    for message_line in diag.message.splitlines():
+        lines.append(f"      {message_line}")
+    if diag.suggestion:
+        lines.append(f"      Suggested: {diag.suggestion}")
+    if diag.confidence:
+        lines.append(f"      Confidence: {diag.confidence}")
+    return lines
+
+
+def render_preflight_text(rep: Report, path: str, *, strict: bool = False) -> str:
+    """Deterministic human-readable rendering (stable enough to diff in a PR)."""
+    out: list[str] = []
+    for diag in rep.items:
+        out.extend(_render_diagnostic_lines(diag))
+        out.append("")
+    counts = rep.counts()
+    mode = "offline preflight" + (" (strict)" if strict else "")
+    out.append(
+        f"{counts['pass']} PASS, {counts['warn']} WARN, {counts['error']} ERROR"
+        f"  |  {path}  |  {mode}"
+    )
+    return "\n".join(out)
+
+
+def render_preflight_json(rep: Report, path: str, *, strict: bool = False) -> str:
+    """Stable machine-readable rendering for `--json` callers and CI."""
+    payload = {
+        "file": path,
+        "strict": bool(strict),
+        "summary": rep.counts(),
+        "exit_code": rep.exit_code(),
+        "diagnostics": [
+            {
+                "level": d.level,
+                "rule_id": d.rule_id,
+                "line": d.line,
+                "excerpt": d.excerpt,
+                "message": d.message,
+                "suggestion": d.suggestion,
+                "confidence": d.confidence,
+                "escalated": d.escalated,
+            }
+            for d in rep.items
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Part 2a: #SBATCH parser
+#
+# Knows where Slurm stops reading directives: option processing halts at the
+# first non-comment, non-blank line, so any later #SBATCH is silently
+# ignored (SLURM011).  Directive arguments are tokenized like a command line
+# (shlex) and values are never shell-expanded by Slurm, which is why shell
+# variables in #SBATCH values are flagged (SLURM010) rather than
+# interpreted here.
+# ---------------------------------------------------------------------------
+
+SHORT_TO_LONG = {
+    "A": "--account",
+    "a": "--array",
+    "B": "--extra-node-list",
+    "b": "--begin",
+    "c": "--cpus-per-task",
+    "C": "--constraint",
+    "d": "--dependency",
+    "D": "--chdir",
+    "e": "--error",
+    "F": "--nodefile",
+    "G": "--gres",
+    "H": "--hold",
+    "i": "--input",
+    "J": "--job-name",
+    "k": "--no-kill",
+    "L": "--licenses",
+    "m": "--distribution",
+    "M": "--clusters",
+    "N": "--nodes",
+    "n": "--ntasks",
+    "O": "--overcommit",
+    "o": "--output",
+    "p": "--partition",
+    "Q": "--quiet",
+    "q": "--qos",
+    "r": "--requeue",
+    "s": "--oversubscribe",
+    "t": "--time",
+    "W": "--wait",
+    "w": "--nodelist",
+    "x": "--exclude",
+}
+
+# Long options that never consume the following token as a value, so
+# "#SBATCH --hold foo" leaves "foo" visible to the bare-token rule (SLURM002)
+# instead of silently absorbing it.
+VALUELESS_LONG = frozenset(
+    {
+        "--contiguous",
+        "--exclusive",
+        "--hold",
+        "--no-kill",
+        "--no-requeue",
+        "--overcommit",
+        "--quiet",
+        "--reboot",
+        "--requeue",
+        "--spread-job",
+    }
+)
+
+_SHELL_VAR_RE = re.compile(r"\$[A-Za-z_{(]")
+_SHORT_OPT_RE = re.compile(r"^-[A-Za-z]")
+
+
+@dataclass
+class Directive:
+    line_no: int
+    option: str  # normalized long form ("--mem") or raw token if unrecognized
+    value: str | None
+    raw: str  # full original line, stripped
+
+    def value_str(self) -> str:
+        return self.value if self.value is not None else ""
+
+
+@dataclass
+class ParsedScript:
+    path: str
+    lines: list[str]
+    shebang: str | None
+    directives: list[Directive] = field(default_factory=list)
+    ignored: list[Directive] = field(default_factory=list)  # after first code line
+    body_lines: list[tuple[int, str]] = field(default_factory=list)
+    parse_errors: list[tuple[int, str]] = field(default_factory=list)
+    by_option: dict[str, list[Directive]] = field(default_factory=dict)
+
+    def get_all(self, option: str) -> list[Directive]:
+        return self.by_option.get(option, [])
+
+    def get(self, option: str, default: Any = None) -> Any:
+        """Value of the last occurrence (sbatch uses the last one)."""
+        directs = self.get_all(option)
+        if not directs:
+            return default
+        return directs[-1].value
+
+    def has(self, option: str) -> bool:
+        return bool(self.get_all(option))
+
+    def directive_for(self, option: str) -> Directive | None:
+        directs = self.get_all(option)
+        return directs[-1] if directs else None
+
+
+def parse_script(path: Path) -> ParsedScript:
+    """Read and tokenize a batch script from disk.
+
+    Raises FleetError rather than a bare OSError so a missing or unreadable
+    script is a normal, reportable refusal -- the same shape as every other
+    fleetctl failure -- instead of an uncaught traceback from deep inside
+    `preflight`.
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        raise FleetError(f"cannot read script {path}: {exc}") from exc
+    return parse_text(text, path=str(path))
+
+
+def parse_text(text: str, path: str = "<memory>") -> ParsedScript:
+    lines = text.splitlines()
+    script = ParsedScript(path=path, lines=lines, shebang=None)
+    if lines and lines[0].startswith("#!"):
+        script.shebang = lines[0].strip()
+
+    in_header = True
+    for line_no, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        if in_header:
+            if not stripped:
+                continue
+            if stripped.startswith("#SBATCH"):
+                script.directives.extend(_parse_directive_line(stripped, line_no, script))
+                continue
+            if stripped.startswith("#"):
+                continue
+            in_header = False
+            script.body_lines.append((line_no, stripped))
+        else:
+            if stripped.startswith("#SBATCH"):
+                script.ignored.extend(_parse_directive_line(stripped, line_no, script))
+            elif stripped and not stripped.startswith("#"):
+                script.body_lines.append((line_no, stripped))
+
+    for directive in script.directives:
+        script.by_option.setdefault(directive.option, []).append(directive)
+    return script
+
+
+def _parse_directive_line(stripped: str, line_no: int, script: ParsedScript) -> list[Directive]:
+    rest = stripped[len("#SBATCH"):]
+    try:
+        tokens = shlex.split(rest, posix=True)
+    except ValueError as exc:
+        script.parse_errors.append((line_no, str(exc)))
+        return [Directive(line_no=line_no, option="", value=None, raw=stripped)]
+
+    # A '#' token starts a trailing comment; sbatch's own parser would not
+    # treat it as an option either.
+    for idx, token in enumerate(tokens):
+        if token.startswith("#"):
+            tokens = tokens[:idx]
+            break
+
+    out: list[Directive] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        value = None
+        if token.startswith("--"):
+            if "=" in token:
+                option, value = token.split("=", 1)
+            else:
+                option = token
+                if option not in VALUELESS_LONG:
+                    value, i = _maybe_value(tokens, i)
+        elif token.startswith("-") and len(token) >= 2:
+            short = token[1:]
+            head = short[:1]
+            if head in SHORT_TO_LONG:
+                # handles both "-p long" and the attached form "-plong"
+                option = SHORT_TO_LONG[head]
+                attached = short[1:]
+                if attached:
+                    value = attached
+                elif option not in VALUELESS_LONG:
+                    value, i = _maybe_value(tokens, i)
+            else:
+                # clustered/unknown short form; flagged by SLURM001
+                option = token
+        else:
+            option = token  # bare token; flagged by SLURM002
+        out.append(Directive(line_no=line_no, option=option, value=value, raw=stripped))
+        i += 1
+    return out
+
+
+def _maybe_value(tokens: list[str], i: int) -> tuple[str | None, int]:
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+    if nxt is not None and not (nxt.startswith("--") or _SHORT_OPT_RE.match(nxt)):
+        return nxt, i + 1
+    return None, i
+
+
+def has_shell_var(value: str | None) -> bool:
+    return bool(value) and bool(_SHELL_VAR_RE.search(value))
+
+
+# ---------------------------------------------------------------------------
+# Slurm value parsing helpers (shared by generic and site rules)
+# ---------------------------------------------------------------------------
+
+
+def parse_time(value: Any) -> int | None:
+    """Seconds for a Slurm time spec, -1 for unlimited, None if unparseable.
+
+    Accepts [DD-]HH:MM:SS, MM:SS, and bare-minutes forms.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in ("-1", "infinite", "unlimited", "UNLIMITED", "INFINITE"):
+        return -1
+    days = 0
+    if "-" in text:
+        day_part, _, text = text.partition("-")
+        if not day_part.isdigit():
+            return None
+        days = int(day_part)
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    if len(nums) == 1:
+        hours, minutes, seconds = 0, nums[0], 0
+    elif len(nums) == 2:
+        hours, minutes, seconds = 0, nums[0], nums[1]
+    else:
+        hours, minutes, seconds = nums
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def fmt_time(seconds: Any) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 0:
+        return "infinite"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}-{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+_MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)([KkMmGgTt]?)(B|b)?$")
+_MEM_FACTOR = {"": 1.0, "K": 1.0 / 1024, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024}
+
+
+def parse_memory(value: Any) -> tuple[float | None, str | None]:
+    """(megabytes, problem) where problem is None, 'B-suffix', or 'invalid'.
+
+    Slurm documents K/M/G/T suffixes for memory options, no trailing B --
+    "16GB" is not a typo sbatch tolerates, it is a value sbatch rejects.
+    """
+    if value is None:
+        return None, "invalid"
+    text = str(value).strip()
+    match = _MEM_RE.match(text)
+    if not match:
+        return None, "invalid"
+    number, suffix, trailing_b = match.groups()
+    problem = "B-suffix" if trailing_b else None
+    mb = float(number) * _MEM_FACTOR[suffix.upper()]
+    return mb, problem
+
+
+def canonical_memory(value: Any) -> str | None:
+    """Rewrite '16GB'/'16gb' -> '16G'; None when already canonical or invalid."""
+    match = _MEM_RE.match(str(value).strip())
+    if not match:
+        return None
+    number, suffix, trailing_b = match.groups()
+    if not trailing_b:
+        return None
+    suffix = suffix.upper() or "M"
+    return f"{number}{suffix}"
+
+
+def expand_hostlist(spec: str, limit: int = 4096) -> list[str]:
+    """Expand 'cn[7-9]' / 'cn[1,4]' style hostlists (no zero-pad beyond the source width)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    match = re.search(r"\[([^\]]*)\]", spec)
+    if not match:
+        return [spec]
+    base = spec[: match.start()]
+    out: list[str] = []
+    for item in match.group(1).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            lo, _, hi = item.partition("-")
+            if lo.isdigit() and hi.isdigit():
+                width = len(lo)
+                for n in range(int(lo), int(hi) + 1):
+                    out.append(f"{base}{str(n).zfill(width)}")
+            else:
+                out.append(base + item)
+        else:
+            out.append(base + item)
+        if len(out) > limit:
+            return out[:limit]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Part 2b: generic Slurm semantics (site-agnostic; every rule ID here is
+# meaningful on any Slurm cluster, not just one fleet's).
+#
+# Stage 1  file structure (shebang, ignored directives, tokenization)
+# Stage 2  shell syntax (bash -n, optional shellcheck)
+# Stage 3  directive semantics (time, counts, memory, output, array, dependency)
+# Stage 4  GPU/GRES syntax (site/type validity is a site-rules question)
+# Stage 6  filesystem references (chdir, cd, output dirs, commands)
+# ---------------------------------------------------------------------------
+
+KNOWN_LONG = frozenset(
+    """
+    --account --acctg-freq --array --begin --bb --bbf --bell --burst-buffer
+    --cluster-constraint --clusters --comment --constraint --contiguous
+    --core-spec --cores-per-socket --cpu-freq --cpus-per-gpu --cpus-per-task
+    --chdir --deadline --delay-boot --dependency --distribution --error
+    --exclude --exclusive --export --extra-node-list --get-user-env --gid
+    --gpu-bind --gpu-freq --gpus --gpus-per-node --gpus-per-socket --gpus-per-task
+    --gres --gres-flags --hint --hold --ignore-pbs --input --job-name
+    --kill-on-invalid-dep --licenses --mail-type --mail-user --mcs-label --mem
+    --mem-bind --mem-per-cpu --mem-per-gpu --mincpus --network --nice --no-kill
+    --no-requeue --nodefile --nodelist --nodes --ntasks --ntasks-per-core
+    --ntasks-per-gpu --ntasks-per-node --ntasks-per-socket --ntasks-per-tres
+    --open-mode --output --overcommit --oversubscribe --partition --power
+    --priority --profile --qos --reboot --requeue --reservation --signal
+    --sockets-per-node --spread-job --switches --threads-per-core --time
+    --time-min --tmp --tres-bind --tres-per-task --uid --wait --wckey --wrap
+    --x11
+    """.split()
+)
+
+# Options that may legitimately appear on multiple #SBATCH lines.
+REPEATABLE = frozenset({"--gres", "--licenses", "--cpu-freq"})
+
+_INT_OPTS = (
+    "--ntasks",
+    "--ntasks-per-node",
+    "--ntasks-per-socket",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
+    "--cpus-per-task",
+    "--cpus-per-gpu",
+    "--sockets-per-node",
+    "--cores-per-socket",
+    "--threads-per-core",
+)
+_GPU_COUNT_OPTS = ("--gpus", "--gpus-per-node", "--gpus-per-socket", "--gpus-per-task")
+_MEM_OPTS = ("--mem", "--mem-per-cpu", "--mem-per-gpu")
+
+_ARRAY_RE = re.compile(r"^\d+(?:-\d+(?::\d+)?)?(?:,\d+(?:-\d+(?::\d+)?)?)*(?:%\d+)?$")
+_DEP_TYPES = frozenset(
+    {"after", "afterok", "afternotok", "afterany", "aftercorr", "afterburstbuffer", "singleton", "expand"}
+)
+_GRES_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+_VALID_PCT = frozenset("AaJjNnstux%")
+
+
+# ---- Stage 1: structure -----------------------------------------------------
+
+
+def check_structure(script: ParsedScript, rep: Report) -> None:
+    if script.shebang is None:
+        rep.error(
+            "SLURM012",
+            "no shebang on line 1; sbatch requires the first line to name an interpreter",
+            suggestion="#!/bin/bash",
+        )
+    for line_no, msg in script.parse_errors:
+        rep.error("SLURM003", f"cannot tokenize #SBATCH line: {msg}", line=line_no)
+    body_start = script.body_lines[0][0] if script.body_lines else None
+    for directive in script.ignored:
+        # sbatch's option parsing stops at the first non-comment, non-blank
+        # line; a directive placed after it is not an error to sbatch, it is
+        # simply invisible, which is a much easier mistake to ship.
+        where = f" (first executable line is {body_start})" if body_start else ""
+        rep.error(
+            "SLURM011",
+            f"#SBATCH below the first executable line is ignored by sbatch{where}",
+            line=directive.line_no,
+            excerpt=directive.raw,
+            suggestion="move the directive above the script body",
+        )
+
+
+# ---- Stage 2: shell syntax --------------------------------------------------
+
+
+class _CommandRunner:
+    """Subprocess facade that never raises; (returncode, combined output).
+
+    Used only for commands that run locally against the script file on this
+    machine -- bash -n, shellcheck, `module show` -- never over SSH.  A
+    missing binary becomes a diagnostic (SH001/SH100/MOD001), not a crash.
+    """
+
+    def __init__(self, timeout: float = 20.0) -> None:
+        self.timeout = timeout
+
+    def run(self, cmd: list[str]) -> tuple[int, str]:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+        except FileNotFoundError:
+            return 127, f"command not found: {cmd[0]}"
+        except subprocess.TimeoutExpired:
+            return 124, f"timeout after {self.timeout}s: {' '.join(cmd)}"
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def check_shell(path: str, rep: Report, runner: Any = None, shellcheck: str = "auto") -> None:
+    if runner is None:
+        runner = _CommandRunner()
+    rc, out = runner.run(["bash", "-n", path])
+    if rc == 127:
+        rep.info("SH001", "bash not available; shell syntax check skipped")
+    elif rc == 0:
+        rep.pass_("SH001", "bash syntax valid")
+    else:
+        rep.error(
+            "SH001",
+            "bash -n reports a syntax error (it reads commands without executing them)",
+            excerpt=_tail(out, 3),
+            suggestion="fix the reported construct",
+        )
+
+    if shellcheck == "off":
+        return
+    rc_v, _ = runner.run(["shellcheck", "--version"])
+    if rc_v != 0:
+        if shellcheck == "on":
+            rep.warn("SH100", "shellcheck requested but not installed")
+        return
+    rc, out = runner.run(["shellcheck", "-s", "bash", path])
+    if rc == 0:
+        rep.pass_("SH101", "shellcheck clean")
+    elif rc == 1:
+        rep.warn("SH101", "shellcheck findings", excerpt=_tail(out, 6))
+    else:
+        rep.warn("SH101", f"shellcheck exited {rc}", excerpt=_tail(out, 3))
+
+
+def _tail(text: str, n: int) -> str | None:
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[-n:]) if lines else None
+
+
+# ---- Stages 3-4: generic directive semantics --------------------------------
+
+
+def check_generic(script: ParsedScript, rep: Report) -> None:
+    _check_options_known(script, rep)
+    _check_duplicates(script, rep)
+    _check_shell_vars(script, rep)
+    _check_time(script, rep)
+    _check_counts(script, rep)
+    _check_memory(script, rep)
+    _check_output_patterns(script, rep)
+    _check_array(script, rep)
+    _check_dependency(script, rep)
+    _check_gpus(script, rep)
+    _check_task_geometry(script, rep)
+
+
+def _check_options_known(script: ParsedScript, rep: Report) -> None:
+    for directive in script.directives:
+        if not directive.option or not directive.option.startswith("-"):
+            if directive.option == "":
+                continue  # pseudo-directive from a tokenization error (SLURM003)
+            rep.warn(
+                "SLURM002",
+                f"'{directive.option}' is not an option; #SBATCH arguments must start with - or --",
+                line=directive.line_no,
+                excerpt=directive.raw,
+            )
+        elif directive.option not in KNOWN_LONG:
+            rep.warn(
+                "SLURM001",
+                f"'{directive.option}' is not a documented sbatch option (typo?)",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion="check man sbatch",
+            )
+
+
+def _check_duplicates(script: ParsedScript, rep: Report) -> None:
+    for option, directs in script.by_option.items():
+        if len(directs) > 1 and option in KNOWN_LONG and option not in REPEATABLE:
+            lines = ", ".join(str(d.line_no) for d in directs)
+            rep.error(
+                "SLURM004",
+                f"duplicate {option} directives (lines {lines}); sbatch uses the last value",
+                line=directs[-1].line_no,
+                excerpt=directs[-1].raw,
+                suggestion="keep exactly one",
+            )
+
+
+def _check_shell_vars(script: ParsedScript, rep: Report) -> None:
+    for directive in script.directives:
+        if has_shell_var(directive.value):
+            rep.error(
+                "SLURM010",
+                "#SBATCH values are read by Slurm directly; the shell never expands them, "
+                "so this variable will be passed literally",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion="write the literal value, or pass --mem=$VAR on the sbatch command "
+                "line where the shell does expand it",
+            )
+
+
+def _check_time(script: ParsedScript, rep: Report) -> None:
+    for option in ("--time", "--time-min"):
+        for directive in script.get_all(option):
+            if parse_time(directive.value) is None:
+                rep.error(
+                    "SLURM030",
+                    f"invalid time spec '{directive.value}'",
+                    line=directive.line_no,
+                    excerpt=directive.raw,
+                    suggestion="use minutes, MM:SS, HH:MM:SS, or D-HH:MM:SS (-1 = unlimited)",
+                )
+
+
+def _check_counts(script: ParsedScript, rep: Report) -> None:
+    for option in _INT_OPTS:
+        for directive in script.get_all(option):
+            value = directive.value or ""
+            if not (value.isdigit() and int(value) >= 1):
+                rep.error(
+                    "SLURM020",
+                    f"{option} expects a positive integer, got '{value}'",
+                    line=directive.line_no,
+                    excerpt=directive.raw,
+                )
+    for directive in script.get_all("--nodes"):
+        value = directive.value or ""
+        match = re.match(r"^(\d+)(?:-(\d+))?$", value)
+        if not match:
+            rep.error(
+                "SLURM020",
+                f"--nodes expects N or N-M, got '{value}'",
+                line=directive.line_no,
+                excerpt=directive.raw,
+            )
+        elif match.group(2) and int(match.group(1)) > int(match.group(2)):
+            rep.error(
+                "SLURM031",
+                f"--nodes range is inverted ({value})",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion=f"--nodes={match.group(2)}-{match.group(1)}",
+            )
+    for option in _GPU_COUNT_OPTS:
+        for directive in script.get_all(option):
+            if not _valid_gpu_count(directive.value):
+                rep.error(
+                    "SLURM020",
+                    f"{option} expects a count like 2 or gpu:a100:2, got '{directive.value}'",
+                    line=directive.line_no,
+                    excerpt=directive.raw,
+                )
+
+
+def _valid_gpu_count(value: str | None) -> bool:
+    if not value:
+        return False
+    if value.isdigit():
+        return True
+    parts = value.split(":")
+    if len(parts) == 2 and parts[1].isdigit() and _GRES_NAME_RE.match(parts[0]):
+        return True
+    if len(parts) == 3 and parts[0] == "gpu" and _GRES_NAME_RE.match(parts[1]) and parts[2].isdigit():
+        return True
+    return False
+
+
+def _check_memory(script: ParsedScript, rep: Report) -> None:
+    present = [script.directive_for(option) for option in _MEM_OPTS if script.has(option)]
+    present = [d for d in present if d]
+    if len(present) > 1:
+        names = ", ".join(sorted({d.option for d in present}))
+        rep.error(
+            "SLURM023",
+            f"mutually exclusive memory options are all set: {names}",
+            suggestion="keep exactly one of --mem, --mem-per-cpu, --mem-per-gpu",
+        )
+    for directive in present:
+        _mb, problem = parse_memory(directive.value)
+        if problem == "invalid":
+            rep.error(
+                "SLURM022",
+                f"{directive.option} value '{directive.value}' is not a valid memory size",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion="e.g. --mem=16G (suffixes K/M/G/T; no suffix means MB)",
+            )
+        elif problem == "B-suffix":
+            canonical = canonical_memory(directive.value)
+            rep.error(
+                "SLURM021",
+                "Slurm documents K/M/G/T suffixes.",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion=f"{directive.option}={canonical}",
+            )
+
+
+def _check_output_patterns(script: ParsedScript, rep: Report) -> None:
+    for option in ("--output", "--error"):
+        for directive in script.get_all(option):
+            bad = _scan_percent(directive.value or "")
+            if bad:
+                rep.warn(
+                    "SLURM040",
+                    f"unknown % substitution(s) {''.join(sorted(bad))} in {option} "
+                    f"(valid: %j %x %A %a %J %N %n %s %t %u %%)",
+                    line=directive.line_no,
+                    excerpt=directive.raw,
+                )
+    out = script.get("--output")
+    err = script.get("--error")
+    if out and err and out == err:
+        rep.warn(
+            "SLURM042",
+            "--output and --error name the same file; stdout and stderr will clobber each other",
+            suggestion="use separate filenames (e.g. %x_%j.out and %x_%j.err)",
+        )
+
+
+def _scan_percent(value: str) -> list[str]:
+    bad = []
+    i = 0
+    while i < len(value):
+        if value[i] == "%":
+            if i + 1 < len(value):
+                if value[i + 1] not in _VALID_PCT:
+                    bad.append(value[i + 1])
+                i += 2
+                continue
+            bad.append("<end>")
+        i += 1
+    return bad
+
+
+def _check_array(script: ParsedScript, rep: Report) -> None:
+    for directive in script.get_all("--array"):
+        value = directive.value or ""
+        valid = bool(_ARRAY_RE.match(value))
+        if valid:
+            for part in value.split("%")[0].split(","):
+                lo, _, hi = part.partition("-")
+                hi = hi.split(":")[0]
+                if hi and int(lo) > int(hi):
+                    valid = False
+        if not valid:
+            rep.error(
+                "SLURM050",
+                f"invalid --array spec '{value}'",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion="e.g. --array=1-10, --array=0-99:10, --array=1-100%8",
+            )
+            continue
+        for option in ("--output", "--error"):
+            pattern = script.get(option) or ""
+            if "%a" not in pattern:
+                rep.warn(
+                    "SLURM041",
+                    f"{option} has no %a; array subtasks will overwrite one file "
+                    "(Slurm defines %A master id and %a task id for arrays)",
+                    suggestion="e.g. logs/%x_%A_%a.out",
+                )
+
+
+def _check_dependency(script: ParsedScript, rep: Report) -> None:
+    for directive in script.get_all("--dependency"):
+        value = directive.value or ""
+        for token in re.split(r"[,&]", value):
+            token = token.strip()
+            if not token or not _valid_dep_token(token):
+                rep.error(
+                    "SLURM060",
+                    f"invalid dependency token '{token}'",
+                    line=directive.line_no,
+                    excerpt=directive.raw,
+                    suggestion="types: after, afterok, afternotok, afterany, aftercorr, "
+                    "afterburstbuffer, singleton — e.g. --dependency=afterok:123:124",
+                )
+
+
+def _valid_dep_token(token: str) -> bool:
+    typ, sep, rest = token.partition(":")
+    if typ not in _DEP_TYPES:
+        return False
+    if not sep:
+        return typ == "singleton"
+    for id_part in re.split(r"[:+]", rest):
+        if not id_part.rstrip("?").isdigit():
+            return False
+    return True
+
+
+def _check_gpus(script: ParsedScript, rep: Report) -> None:
+    for directive in script.get_all("--gres"):
+        value = directive.value or ""
+        if not _valid_gres(value):
+            rep.error(
+                "SLURM070",
+                f"invalid --gres spec '{value}'",
+                line=directive.line_no,
+                excerpt=directive.raw,
+                suggestion="--gres=name[:type]:count — e.g. gpu, gpu:2, gpu:a100:1 "
+                "(actual type strings come from the cluster)",
+            )
+    gres_gpu = any((d.value or "").split(":")[0] == "gpu" for d in script.get_all("--gres"))
+    flags = [option for option in _GPU_COUNT_OPTS if script.has(option)]
+    if gres_gpu and flags:
+        rep.warn(
+            "SLURM071",
+            f"GPUs requested via both --gres and {'/'.join(flags)}; Slurm merges these — prefer one form",
+        )
+
+
+def _valid_gres(value: str) -> bool:
+    parts = value.split(":")
+    if not parts or not _GRES_NAME_RE.match(parts[0]):
+        return False
+    if len(parts) == 1:
+        return True
+    if len(parts) == 2:
+        return parts[1].isdigit() and int(parts[1]) >= 1 or bool(_GRES_NAME_RE.match(parts[1]))
+    if len(parts) == 3:
+        return bool(_GRES_NAME_RE.match(parts[1])) and parts[2].isdigit() and int(parts[2]) >= 1
+    return False
+
+
+def _check_task_geometry(script: ParsedScript, rep: Report) -> None:
+    ntasks = script.get("--ntasks")
+    ntpn = script.get("--ntasks-per-node")
+    nodes = script.get("--nodes")
+    if not (ntasks and ntpn and nodes and ntasks.isdigit() and ntpn.isdigit()):
+        return
+    match = re.match(r"^(\d+)(?:-(\d+))?$", nodes)
+    if not match:
+        return
+    hi = int(match.group(2) or match.group(1))
+    if int(ntasks) != int(ntpn) * hi:
+        rep.warn(
+            "SLURM080",
+            f"--ntasks={ntasks} but ntasks-per-node x nodes covers {int(ntpn) * hi}; "
+            "nodes/tasks/cpus interact, they are not three spellings of one request",
+        )
+
+
+# ---- Stage 6: filesystem references -----------------------------------------
+
+
+def check_filesystem(script: ParsedScript, rep: Report) -> None:
+    chdir = script.get("--chdir")
+    if chdir:
+        target = os.path.expanduser(chdir)
+        if os.path.isabs(target) and not os.path.isdir(target):
+            chdir_d = script.directive_for("--chdir")
+            rep.error(
+                "FS001",
+                f"--chdir target does not exist on this host: {target}",
+                line=chdir_d.line_no if chdir_d else None,
+                excerpt=chdir_d.raw if chdir_d else None,
+                suggestion="create it, or point at the recommended storage area",
+            )
+    for line_no, text in script.body_lines:
+        match = re.match(r"^cd\s+([^\s;&|]+)", text)
+        if not match:
+            continue
+        target = os.path.expanduser(match.group(1))
+        if target.startswith("$") or not os.path.isabs(target):
+            continue
+        if not os.path.isdir(target):
+            rep.error(
+                "FS001",
+                f"cd target does not exist on this host: {target}",
+                line=line_no,
+                excerpt=text,
+            )
+    for option in ("--output", "--error"):
+        for directive in script.get_all(option):
+            value = directive.value or ""
+            dirpart = os.path.dirname(value)
+            if not dirpart or dirpart == ".":
+                continue
+            # sbatch requires the output directory to exist at submit time,
+            # even when the filename itself uses %j-style patterns
+            if not os.path.isdir(_resolve_exists_dir(dirpart, chdir, script.path)):
+                rep.warn(
+                    "FS003",
+                    f"directory for {option} does not exist yet: {dirpart}",
+                    line=directive.line_no,
+                    suggestion=f"mkdir -p {dirpart} in the submission directory before "
+                    "submitting (sbatch opens output files at submit time)",
+                )
+    for line_no, text in _iter_command_lines(script):
+        words = text.split()
+        if not words:
+            continue
+        exe = words[0]
+        if "/" in exe:
+            if not _resolve_exists(exe, chdir, script.path):
+                rep.error(
+                    "FS002",
+                    f"executable path does not exist: {exe}",
+                    line=line_no,
+                    excerpt=text,
+                )
+        elif shutil.which(exe) is None:
+            rep.warn(
+                "FS002",
+                f"command '{exe}' not found on this host; fine if a module provides it on the cluster",
+                line=line_no,
+                excerpt=text,
+                confidence=CONF_INFERRED,
+            )
+        if words[0] in ("python", "python3", "python2") and len(words) > 1:
+            arg = words[1]
+            if arg.startswith(("./", "../", "/")) and not _resolve_exists(arg, chdir, script.path):
+                rep.warn(
+                    "FS002",
+                    f"script argument not found: {arg}",
+                    line=line_no,
+                    excerpt=text,
+                    confidence=CONF_INFERRED,
+                )
+
+
+def _resolve_exists_dir(dirpart: str, chdir: str | None, script_path: str) -> str:
+    if os.path.isabs(dirpart):
+        return dirpart
+    if chdir and not chdir.startswith("$"):
+        base = os.path.expanduser(chdir)
+        if os.path.isdir(base):
+            return os.path.join(base, dirpart)
+    return os.path.join(os.path.dirname(os.path.abspath(script_path)), dirpart)
+
+
+def _resolve_exists(path: str, chdir: str | None, script_path: str) -> bool:
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        base = os.path.expanduser(chdir) if chdir and not chdir.startswith("$") else os.path.dirname(os.path.abspath(script_path))
+        expanded = os.path.join(os.path.expanduser(base) if not os.path.isabs(base) else base, expanded)
+    return os.path.exists(expanded)
+
+
+def _iter_command_lines(script: ParsedScript) -> Iterable[tuple[int, str]]:
+    for line_no, text in script.body_lines:
+        stripped = text.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        while True:
+            match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+", stripped)
+            if not match:
+                break
+            stripped = stripped[match.end():].strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("cd ", "cd\t", "module ", "module\t", "source ", ". ", "export ", "set ")):
+            continue
+        if any(op in stripped for op in (";", "&&", "||", "|", ">>", ">")):
+            continue
+        yield line_no, stripped
+
+
+# ---- Stage 6b: module resolution (only when the module command is available) --
+
+_MODULE_LOAD_RE = re.compile(r"^module\s+load\s+(.+)$")
+
+
+def check_modules(script: ParsedScript, rep: Report, runner: Any = None) -> None:
+    if runner is None:
+        runner = _CommandRunner()
+    loads: list[tuple[int, str, list[str]]] = []
+    for line_no, text in script.body_lines:
+        match = _MODULE_LOAD_RE.match(text.strip())
+        if match:
+            names = shlex.split(match.group(1))
+            loads.append((line_no, text, [n for n in names if not n.startswith("-")]))
+    if not loads:
+        return
+
+    rc, _ = runner.run(["bash", "-lc", "type module"])
+    if rc != 0:
+        rep.info(
+            "MOD001",
+            f"module command not available here; {sum(len(n) for _, _, n in loads)} "
+            "module load(s) left unchecked (verify with `module avail` on the login node)",
+        )
+        return
+    for line_no, text, names in loads:
+        for name in names:
+            quoted = shlex.quote(name)
+            rc, _out = runner.run(["bash", "-lc", f"module show {quoted} >/dev/null 2>&1"])
+            if rc == 0:
+                rep.pass_("MOD002", f"module '{name}' resolvable", line=line_no)
+            else:
+                rep.warn(
+                    "MOD002",
+                    f"module '{name}' not found by `module show`",
+                    line=line_no,
+                    excerpt=text,
+                    suggestion="check `module avail` on the login node; never trust "
+                    "module versions printed in documentation",
+                )
+
+
+# ---------------------------------------------------------------------------
+# GPU request extraction (shared with site rules)
+# ---------------------------------------------------------------------------
+
+
+def iter_gpu_requests(script: ParsedScript) -> Iterable[tuple[int, str, str | None, int | None]]:
+    """Yield (line_no, raw, gpu_type_or_None, count_or_None) per GPU request."""
+    for directive in script.get_all("--gres"):
+        parts = (directive.value or "").split(":")
+        if not parts or parts[0] != "gpu":
+            continue
+        if len(parts) == 3:
+            gtype, count = parts[1], int(parts[2]) if parts[2].isdigit() else None
+        elif len(parts) == 2 and parts[1].isdigit():
+            gtype, count = None, int(parts[1])
+        else:
+            gtype, count = None, None
+        yield directive.line_no, directive.raw, gtype, count
+    for option in _GPU_COUNT_OPTS:
+        for directive in script.get_all(option):
+            value = directive.value or ""
+            parts = value.split(":")
+            if len(parts) == 3 and parts[0] == "gpu":
+                gtype, count = parts[1], int(parts[2]) if parts[2].isdigit() else None
+            elif len(parts) == 2 and parts[1].isdigit():
+                gtype, count = None, int(parts[1])
+            elif value.isdigit():
+                gtype, count = None, int(value)
+            else:
+                gtype, count = None, None
+            yield directive.line_no, directive.raw, gtype, count
+
+
+# ---------------------------------------------------------------------------
+# Part 3: site policy (stage 5), data-driven off ProtocolRecord/QueueRecord
+#
+# The original tool hardcoded one cluster's policy against a hand-written
+# YAML file kept in the repo.  Here the same shape of policy -- which
+# partitions exist, which accounts and QOS they accept, what their MaxTime
+# and GRES types are, whether they are GPU-only -- is just data the fleet
+# config already carries on QueueRecord, so the same rules run for whatever
+# site a target's protocol names.  `protocol.rule_prefix` keeps each site's
+# diagnostics distinctly searchable (e.g. KIAC023) the same way the original
+# per-site rule_prefix did.
+#
+# Two YAML-only concepts from the original config have no equivalent field
+# on QueueRecord and are collapsed rather than dropped outright:
+#
+#   * `documented_max_times` was a *list* of disputed candidate values (e.g.
+#     "48:00:00 vs 24:00:00" where the manual contradicted itself).  The new
+#     schema has a single `max_time`.  The disputed nuance survives through
+#     `evidence == "document-conflict"`: when a queue is that unsure of its
+#     own limit, rule 031/032 (WARN/INFO) fire instead of the flat 030
+#     (ERROR), even though only one number is available to compare against.
+#   * `assume_storage_writable` and `home_quota_note` were separate policy
+#     flags/strings.  They are folded into the single `storage_caveat`
+#     field, which is appended to both the "you're on the recommended
+#     storage" and "you're under $HOME" messages.
+#
+# One rule (060, nodelist vs. partition nodes) needs a per-partition node
+# list, which a queue carries in its own `nodes` key rather than in
+# `[capabilities]` -- a capability is a single value a `--require` can
+# compare, and a hostlist compares to nothing.  A site that declares no
+# `nodes` gets no check, which is the same behavior as every other rule here
+# when its data is absent.
+# ---------------------------------------------------------------------------
+
+
+def _rid(protocol: ProtocolRecord, code: str) -> str:
+    return f"{protocol.rule_prefix or 'SITE'}{code}"
+
+
+def check_site_policy(script: ParsedScript, rep: Report, protocol: ProtocolRecord) -> None:
+    """Run every site-policy rule for the queue named by the script's --partition."""
+    part = script.get("--partition")
+    part_d = script.directive_for("--partition")
+    queue = protocol.queue_named(part) if part else None
+
+    _check_site_partition(rep, protocol, part, part_d, queue)
+    _check_site_account(script, rep, protocol, part, part_d, queue)
+    _check_site_test_only_blind_spot(rep, queue)
+    _check_site_time(script, rep, protocol, part, queue)
+    _check_site_storage(script, rep, protocol)
+    _check_site_gpu_types(script, rep, protocol, part, queue)
+    _check_site_gpu_only(script, rep, protocol, part, queue)
+    _check_site_gpu_vendor_tools(script, rep, protocol)
+    _check_site_nodelist(script, rep, protocol, part, queue)
+
+
+def _check_site_partition(
+    rep: Report,
+    protocol: ProtocolRecord,
+    part: str | None,
+    part_d: Directive | None,
+    queue: QueueRecord | None,
+) -> None:
+    if part is None:
+        rep.error(
+            _rid(protocol, "001"),
+            f"no --partition directive; {protocol.name} usage requires an explicit partition",
+            suggestion="pick a documented queue; do not assume a cluster default",
+        )
+        return
+    if queue is None:
+        known = sorted({q.partition for q in protocol.queues} | {q.name for q in protocol.queues})
+        detail = f" (known: {', '.join(known)})" if known else ""
+        # Unknown partitions are rejected offline rather than passed through:
+        # there is no live scheduler to ask in this stage, and a name only an
+        # example script used is exactly the kind of thing a manual gets wrong.
+        rep.error(
+            _rid(protocol, "011"),
+            f'"--partition={part}" is not a documented queue for {protocol.name} and cannot '
+            f"be verified offline{detail}",
+            line=part_d.line_no if part_d else None,
+            excerpt=part_d.raw if part_d else None,
+            suggestion="use a documented partition, or verify with a real submission",
+            confidence=CONF_DOCUMENTED,
+        )
+        return
+    conf = queue.evidence or CONF_DOCUMENTED
+    rep.pass_(
+        _rid(protocol, "010"),
+        f"partition '{part}' is documented for {protocol.name}",
+        line=part_d.line_no if part_d else None,
+        confidence=conf,
+    )
+    if any("example-only" in (note or "").casefold().replace(" ", "-") for note in queue.notes):
+        rep.info(
+            _rid(protocol, "010"),
+            f"partition '{part}' is named only in an example script — confirm it (and its "
+            "limits) with a real submission before relying on it",
+            line=part_d.line_no if part_d else None,
+            confidence=conf,
+        )
+
+
+def _check_site_account(
+    script: ParsedScript,
+    rep: Report,
+    protocol: ProtocolRecord,
+    part: str,
+    part_d: Directive | None,
+    queue: QueueRecord | None,
+) -> None:
+    if queue is not None and queue.account_required:
+        acc = script.directive_for("--account")
+        if acc is None or not acc.value:
+            suggestion = "Add: #SBATCH --account=<account>"
+            if queue.allowed_accounts:
+                suggestion = f"Add: #SBATCH --account=<one of: {', '.join(queue.allowed_accounts)}>"
+            rep.error(
+                _rid(protocol, "020"),
+                f"{part.upper()} jobs require an account.",
+                line=part_d.line_no if part_d else None,
+                excerpt=part_d.raw if part_d else None,
+                suggestion=suggestion,
+            )
+    _check_site_account_policy(script, rep, protocol, part, queue)
+    _check_site_qos(script, rep, protocol, part, queue)
+
+
+def _check_site_account_policy(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    """Account-to-partition permission, enforced even though `--test-only` will not.
+
+    A request from a denied (or simply un-allowed) account passes the dry
+    run cleanly and then pends forever with "Job's account not permitted to
+    use this partition" -- a failure mode with no offline signal at all
+    unless the allow/deny matrix is checked here, against data the queue
+    already declares.
+    """
+    if queue is None or not (queue.allowed_accounts or queue.denied_accounts):
+        return
+    acc = script.directive_for("--account")
+    if acc is None or not acc.value:
+        return
+    conf = queue.evidence or CONF_DOCUMENTED
+    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    if acc.value in queue.denied_accounts or (
+        queue.allowed_accounts and acc.value not in queue.allowed_accounts
+    ):
+        rep.error(
+            _rid(protocol, "023"),
+            f"account '{acc.value}' is not permitted on partition '{part}'{tag}. "
+            "The job would pass sbatch --test-only and then stay pending with "
+            "\"Job's account not permitted to use this partition\"",
+            line=acc.line_no,
+            excerpt=acc.raw,
+            suggestion=(
+                f"use one of: {', '.join(queue.allowed_accounts)}"
+                if queue.allowed_accounts
+                else f"do not use '{acc.value}' on '{part}'"
+            ),
+            confidence=conf,
+        )
+    elif queue.allowed_accounts and acc.value in queue.allowed_accounts:
+        rep.pass_(
+            _rid(protocol, "023"),
+            f"account '{acc.value}' is permitted on '{part}'{tag}",
+            line=acc.line_no,
+            confidence=conf,
+        )
+
+
+def _check_site_qos(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    if queue is None or not queue.required_qos:
+        return
+    required = queue.required_qos
+    qos_d = script.directive_for("--qos")
+    conf = queue.evidence or CONF_DOCUMENTED
+    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    if qos_d is None or not qos_d.value:
+        rep.error(
+            _rid(protocol, "024"),
+            f"partition '{part}' requires --qos={required}{tag}; without it the job stays "
+            "pending with \"Job's QOS not permitted to use this partition\"",
+            suggestion=f"Add: #SBATCH --qos={required}",
+            confidence=conf,
+        )
+    elif qos_d.value != required:
+        rep.error(
+            _rid(protocol, "024"),
+            f"--qos={qos_d.value} is not permitted on '{part}'; the required value is "
+            f"'{required}'{tag}",
+            line=qos_d.line_no,
+            excerpt=qos_d.raw,
+            suggestion=f"#SBATCH --qos={required}",
+            confidence=conf,
+        )
+    else:
+        rep.pass_(
+            _rid(protocol, "024"),
+            f"--qos={required} matches the required QOS for '{part}'{tag}",
+            line=qos_d.line_no,
+            confidence=conf,
+        )
+
+
+def _check_site_test_only_blind_spot(rep: Report, queue: QueueRecord | None) -> None:
+    """The LIVE002-equivalent caveat: a clean dry run proves less than it looks like.
+
+    `sbatch --test-only` validates syntax and resource shape, not account or
+    QOS policy -- verified the hard way (a denied account's job passed the
+    dry run and then pended indefinitely).  Whenever a queue declares any of
+    that policy, say so up front rather than let a clean --test-only be
+    mistaken for a green light on the account/QOS combination too.
+    """
+    if queue is None:
+        return
+    if queue.allowed_accounts or queue.denied_accounts or queue.required_qos:
+        rep.info(
+            "LIVE002",
+            "sbatch --test-only does not enforce account-partition or QOS policy; a request "
+            "can pass the dry run and still pend forever, so only a real submission proves "
+            "this account/QOS combination is actually accepted",
+            confidence=CONF_DOCUMENTED,
+        )
+
+
+def _check_site_time(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    time_d = script.directive_for("--time")
+    if time_d is None:
+        return
+    want = parse_time(time_d.value)
+    if want is None or want <= 0:
+        return  # malformed/unlimited spec is SLURM030's job, not a site-policy question
+    if queue is None or not queue.max_time:
+        return
+    max_seconds = parse_time(queue.max_time)
+    if max_seconds is None or max_seconds < 0:
+        return
+    evidence = queue.evidence
+    conf = evidence or CONF_DOCUMENTED
+    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    verified = evidence in (CONF_VERIFIED_BY_RUN, CONF_VERIFIED_LIVE)
+    disputed = evidence == CONF_CONFLICT
+
+    if verified:
+        if want > max_seconds:
+            rep.error(
+                _rid(protocol, "033"),
+                f"--time={time_d.value} exceeds the verified MaxTime {fmt_time(max_seconds)} "
+                f"for '{part}'{tag}",
+                line=time_d.line_no,
+                excerpt=time_d.raw,
+                suggestion=f"stay <= {fmt_time(max_seconds)}",
+                confidence=conf,
+            )
+        else:
+            rep.pass_(
+                _rid(protocol, "033"),
+                f"--time={time_d.value} within the verified MaxTime {fmt_time(max_seconds)} "
+                f"for '{part}'{tag}",
+                line=time_d.line_no,
+                confidence=conf,
+            )
+    elif disputed:
+        if want > max_seconds:
+            rep.warn(
+                _rid(protocol, "031"),
+                f"documented MaxTime for '{part}' is disputed; --time={time_d.value} may "
+                f"exceed the real limit (candidate: {fmt_time(max_seconds)})",
+                line=time_d.line_no,
+                excerpt=time_d.raw,
+                suggestion="confirm the real limit with a real submission",
+                confidence=conf,
+            )
+        else:
+            rep.info(
+                _rid(protocol, "032"),
+                f"documented MaxTime for '{part}' is disputed, but --time={time_d.value} "
+                f"fits the candidate limit {fmt_time(max_seconds)}",
+                line=time_d.line_no,
+                confidence=conf,
+            )
+    else:
+        if want > max_seconds:
+            rep.error(
+                _rid(protocol, "030"),
+                f"--time={time_d.value} exceeds the documented MaxTime {fmt_time(max_seconds)} "
+                f"for '{part}'",
+                line=time_d.line_no,
+                excerpt=time_d.raw,
+                suggestion=f"stay <= {fmt_time(max_seconds)} until verified",
+                confidence=conf,
+            )
+        else:
+            rep.pass_(
+                _rid(protocol, "030"),
+                f"--time={time_d.value} within the documented MaxTime {fmt_time(max_seconds)}",
+                line=time_d.line_no,
+                confidence=conf,
+            )
+
+
+def _check_site_storage(script: ParsedScript, rep: Report, protocol: ProtocolRecord) -> None:
+    preferred = protocol.preferred_storage
+    if not preferred:
+        return
+    home = (protocol.home_prefix or os.path.expanduser("~")).rstrip("/")
+    caveat = f" — {protocol.storage_caveat}" if protocol.storage_caveat else ""
+    candidates: list[tuple[int | None, str]] = []
+    chdir = script.get("--chdir")
+    if chdir:
+        candidates.append((None, chdir))
+    for line_no, text in script.body_lines:
+        match = re.match(r"^cd\s+([^\s;&|]+)", text)
+        if match:
+            candidates.append((line_no, match.group(1)))
+    praised = False
+    for line_no, target in candidates:
+        expanded = os.path.expanduser(target)
+        if expanded.startswith("$"):
+            continue
+        if expanded == preferred or expanded.startswith(preferred + "/"):
+            if not praised:
+                rep.pass_(
+                    _rid(protocol, "040"),
+                    f"working directory '{expanded}' is on the recommended storage "
+                    f"({preferred}){caveat}",
+                    confidence=CONF_DOCUMENTED,
+                )
+                praised = True
+        elif expanded == home or expanded.startswith(home + "/"):
+            rep.warn(
+                _rid(protocol, "040"),
+                f"working directory '{expanded}' is under the home directory; documentation "
+                f"recommends {preferred} for workload data{caveat}",
+                line=line_no,
+                confidence=CONF_DOCUMENTED,
+                suggestion=f"move data to {preferred}/<project> after confirming it suits "
+                "your retention needs",
+            )
+
+
+def _check_site_gpu_types(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    if queue is None or not queue.gres_types:
+        return
+    types = {g.casefold() for g in queue.gres_types}
+    evidence = queue.evidence
+    verified = evidence in (CONF_VERIFIED_BY_RUN, CONF_VERIFIED_LIVE)
+    conf = evidence or CONF_DOCUMENTED
+    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    for line_no, raw, gtype, _count in iter_gpu_requests(script):
+        if gtype is None:
+            continue
+        if gtype.casefold() in types:
+            rep.pass_(
+                _rid(protocol, "051" if verified else "050"),
+                f"GPU type '{gtype}' is {'verified' if verified else 'documented'} on "
+                f"partition '{part}'{tag}",
+                line=line_no,
+                confidence=conf,
+            )
+        elif verified:
+            rep.error(
+                _rid(protocol, "051"),
+                f"GPU type '{gtype}' is not among the types verified on '{part}' "
+                f"({', '.join(sorted(types))}){tag}",
+                line=line_no,
+                excerpt=raw,
+                suggestion="request one of the verified types above, or re-check after the "
+                "site's GRES matrix changes",
+                confidence=conf,
+            )
+        else:
+            rep.warn(
+                _rid(protocol, "050"),
+                f"GPU type '{gtype}' is not in the documented catalog for '{part}' "
+                f"({', '.join(sorted(types))})",
+                line=line_no,
+                excerpt=raw,
+                suggestion="request one of the documented types above, or confirm with a "
+                "real submission",
+                confidence=conf,
+            )
+
+
+def _check_site_gpu_only(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    """A GPU-only queue rejecting a CPU-only job.
+
+    Some sites monitor GPU queues for CPU-only occupancy and can block the
+    offending account -- this is a policy violation, not a performance
+    suggestion, so it is an ERROR rather than a WARN.
+    """
+    if queue is None or not queue.gpu_only:
+        return
+    gpu_requested = any(
+        count is None or count >= 1 for _line_no, _raw, _gtype, count in iter_gpu_requests(script)
+    )
+    if gpu_requested:
+        return
+    rep.error(
+        _rid(protocol, "070"),
+        f"partition '{part}' is a GPU-only queue (site policy; CPU-only jobs there are "
+        "monitored and can get the account blocked), but this script requests no GPU",
+        suggestion="add --gres=gpu:N, or move the CPU workload to a CPU partition",
+        confidence=CONF_DOCUMENTED,
+    )
+
+
+def _check_site_gpu_vendor_tools(script: ParsedScript, rep: Report, protocol: ProtocolRecord) -> None:
+    """Catches the wrong vendor's inspection tool -- it fails silent, not loud.
+
+    `nvidia-smi` against an AMD card does not error usefully; it just burns
+    the job's walltime reporting nothing, which is a worse outcome than a
+    syntax error because nothing about the job looks wrong until it times out.
+    """
+    if protocol.gpu_vendor != "amd":
+        return
+    for line_no, text in script.body_lines:
+        if "nvidia-smi" in text:
+            rep.error(
+                _rid(protocol, "071"),
+                f"'nvidia-smi' cannot work here: {protocol.name} has AMD GPUs",
+                line=line_no,
+                excerpt=text,
+                suggestion="use rocm-smi (or rocminfo) to inspect AMD GPUs",
+                confidence=CONF_DOCUMENTED,
+            )
+
+
+def _check_site_nodelist(
+    script: ParsedScript, rep: Report, protocol: ProtocolRecord, part: str, queue: QueueRecord | None
+) -> None:
+    """Warn when --nodelist names a node that belongs to a different queue.
+
+    Pinning a node is how a job ends up pending against a partition that does
+    not contain it -- a pairing the scheduler accepts at submit time and then
+    never satisfies.  Only fires for a site whose queues declare `nodes`; with
+    none declared it is a silent no-op, like every rule here whose data is
+    absent.
+    """
+    nodelist = script.get("--nodelist")
+    if not nodelist:
+        return
+    nodelist_d = script.directive_for("--nodelist")
+    node_map: dict[str, str] = {}
+    for q in protocol.queues:
+        for spec in q.nodes:
+            for node in expand_hostlist(spec):
+                node_map[node] = q.partition
+    if not node_map:
+        return
+    for node in expand_hostlist(nodelist):
+        mapped = node_map.get(node)
+        if mapped and part and mapped != part:
+            rep.warn(
+                _rid(protocol, "060"),
+                f"node '{node}' is documented under partition '{mapped}', not '{part}'",
+                line=nodelist_d.line_no if nodelist_d else None,
+                confidence=CONF_DOCUMENTED,
+                suggestion="drop --nodelist or match it to the partition",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def preflight_script(
+    path: Path,
+    *,
+    protocol: ProtocolRecord,
+    strict: bool = False,
+    shellcheck: bool = False,
+) -> Report:
+    """Run the full offline batch-script preflight and return its Report.
+
+    Ordering mirrors sbatch's own worldview: structure and shell syntax
+    first (a script that cannot parse cannot be reasoned about further),
+    then generic Slurm semantics that hold on every site, then -- only for
+    a Slurm protocol -- the submitting site's own policy.  Nothing here
+    touches the network or a remote host: this is the check that runs
+    before a script is ever staged, so a mistake here costs milliseconds
+    instead of a wasted sync and a job that pends for a day.
+    """
+    script = parse_script(path)
+    rep = Report()
+
+    check_structure(script, rep)
+    check_shell(str(path), rep, shellcheck=("on" if shellcheck else "off"))
+    check_generic(script, rep)
+    check_filesystem(script, rep)
+    check_modules(script, rep)
+    if protocol.kind == "slurm":
+        check_site_policy(script, rep, protocol)
+
+    if strict:
+        rep.escalate_warnings()
+    return rep
+
+
 # ---- SECTION: resolution (config + args -> Plan, no remote I/O) ------------
 
 
@@ -2207,6 +3967,14 @@ PROTOCOL_KEYS = frozenset(
         "docs",
         "notes",
         "queue",
+        # Site facts the preflight enforces.  They describe the cluster behind
+        # the login node, which is why they sit on the protocol rather than the
+        # target: every host that submits to this scheduler inherits them.
+        "gpu_vendor",
+        "preferred_storage",
+        "home_prefix",
+        "storage_caveat",
+        "rule_prefix",
     }
 )
 QUEUE_KEYS = frozenset(
@@ -2226,6 +3994,29 @@ QUEUE_KEYS = frozenset(
         "directives",
         "notes",
         "capabilities",
+        # Policy the scheduler enforces but `sbatch --test-only` does not.
+        # A request can pass the dry run and then pend forever because the
+        # account is not permitted on the partition, so the preflight checks
+        # the matrix itself; that is only possible if the matrix is declared.
+        # `max_time` is the scheduler's MaxTime, distinct from `time_limit`,
+        # which is what this preset *requests*.
+        "max_time",
+        "allowed_accounts",
+        "denied_accounts",
+        "required_qos",
+        "account_required",
+        "gres_types",
+        "gpu_only",
+        # Which nodes this partition covers, as Slurm hostlists ("cn[7-9]").
+        # Not a capability: `[capabilities]` holds single values a `--require`
+        # can compare, and a node list compares to nothing. It is here so
+        # `--nodelist` can be checked against the partition it was paired with.
+        "nodes",
+        # How well any of the above is known.  A queue asserting a policy it
+        # only read in a manual should not refuse a submission the same way a
+        # queue asserting one a real job proved does.
+        "evidence",
+        "as_of",
     }
 )
 PROFILE_KEYS = frozenset(
@@ -2282,6 +4073,20 @@ SECRET_KEYS = frozenset(
 SECRET_BACKENDS = ("file", "pass", "inline", "command")
 PROTOCOL_KINDS = ("direct", "slurm")
 GPU_REQUEST_MODES = ("none", "gpus", "gres")
+GPU_VENDORS = ("nvidia", "amd", "intel")
+# How a declared site fact came to be known, worst to best.  The distinction is
+# operational, not bookkeeping: a cluster manual that contradicts itself is a
+# real thing to have read, and a partition limit a job actually hit is a
+# different kind of claim from one an example script implied.  `preflight`
+# labels its findings with these, so a refusal can be argued with on the right
+# grounds -- and `doctor` can say which "verified" facts have gone stale.
+EVIDENCE_CLASSES = (
+    "verified-by-run",
+    "verified-live",
+    "documented",
+    "document-conflict",
+    "inferred",
+)
 AUTH_MODES = ("key", "password")
 STRICT_HOST_KEY_MODES = ("yes", "no", "off", "ask", "accept-new")
 
@@ -2695,6 +4500,26 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
                     constraint=optional_str(item.get("constraint")),
                     extra_directives=directive_values,
                     notes=note_values,
+                    max_time=optional_str(item.get("max_time")),
+                    allowed_accounts=optional_str_tuple(item.get("allowed_accounts")),
+                    denied_accounts=optional_str_tuple(item.get("denied_accounts")),
+                    required_qos=optional_str(item.get("required_qos")),
+                    account_required=bool(item.get("account_required", False)),
+                    gres_types=optional_str_tuple(item.get("gres_types")),
+                    gpu_only=bool(item.get("gpu_only", False)),
+                    nodes=optional_str_tuple(item.get("nodes")),
+                    evidence=(
+                        check_vocabulary(
+                            str(item["evidence"]),
+                            EVIDENCE_CLASSES,
+                            what=f"queue {queue_name!r} in {what}",
+                            key="evidence",
+                            source=source,
+                        )
+                        if item.get("evidence") is not None
+                        else None
+                    ),
+                    as_of=optional_str(item.get("as_of")),
                     capabilities=parse_capabilities(
                         item.get("capabilities", {}),
                         what=f"`[queue.capabilities]` for {queue_name!r} in {what}",
@@ -2737,6 +4562,21 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             docs=doc_values,
             notes=note_values,
             queues=tuple(queues),
+            gpu_vendor=(
+                check_vocabulary(
+                    str(raw["gpu_vendor"]),
+                    GPU_VENDORS,
+                    what=what,
+                    key="gpu_vendor",
+                    source=source,
+                )
+                if raw.get("gpu_vendor") is not None
+                else None
+            ),
+            preferred_storage=optional_str(raw.get("preferred_storage")),
+            home_prefix=optional_str(raw.get("home_prefix")),
+            storage_caveat=optional_str(raw.get("storage_caveat")),
+            rule_prefix=optional_str(raw.get("rule_prefix")),
         )
     return protocols
 
@@ -2886,6 +4726,51 @@ def target_schema_warnings(path: Path) -> list[str]:
     return warnings
 
 
+STALE_EVIDENCE_DAYS = 180
+
+
+def queue_evidence_warnings(protocols: dict[str, ProtocolRecord]) -> list[str]:
+    """Report site policy that claims verification but has aged out.
+
+    A queue saying `evidence = "verified-by-run"` is the strongest claim in the
+    config, and `preflight` refuses submissions on the strength of it.  Cluster
+    associations change without announcement, so the claim needs a date on it
+    and the date needs somebody to look at it -- otherwise "verified" quietly
+    decays into "was true once", which is the failure mode the evidence classes
+    exist to prevent.  A warning, never an error: a stale fact is usually still
+    the right fact, and doctor's job here is to say when it was last checked.
+    """
+    warnings: list[str] = []
+    today = datetime.date.today()
+    for name, protocol in sorted(protocols.items()):
+        for queue in protocol.queues:
+            if queue.evidence not in ("verified-by-run", "verified-live"):
+                continue
+            if not queue.as_of:
+                warnings.append(
+                    f"queue {queue.name!r} in protocol {name!r} claims "
+                    f"{queue.evidence!r} with no `as_of` date, so nothing can say "
+                    "whether it still holds"
+                )
+                continue
+            try:
+                seen = datetime.date.fromisoformat(queue.as_of)
+            except ValueError:
+                warnings.append(
+                    f"queue {queue.name!r} in protocol {name!r} has an unreadable "
+                    f"`as_of` ({queue.as_of!r}); use YYYY-MM-DD"
+                )
+                continue
+            age = (today - seen).days
+            if age > STALE_EVIDENCE_DAYS:
+                warnings.append(
+                    f"queue {queue.name!r} in protocol {name!r} was last verified "
+                    f"{age} days ago ({queue.as_of}); re-check its accounts, QOS "
+                    "and limits with a real job before trusting a preflight PASS"
+                )
+    return warnings
+
+
 def deprecated_key_warnings(paths: FleetPaths) -> list[str]:
     """Name every config file still carrying a key nothing reads."""
     warnings: list[str] = []
@@ -3002,6 +4887,20 @@ def optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def optional_str_tuple(value: Any) -> tuple[str, ...]:
+    """Normalize a config value that may be one string or a list of them.
+
+    TOML makes writing `notes = "one thing"` natural and `notes = ["one
+    thing"]` pedantic, so both are accepted everywhere a list is meant.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        return (text,) if text else ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
 
 
 def optional_int(value: Any) -> int | None:
@@ -4991,6 +6890,11 @@ def protocol_display(protocol: ProtocolRecord) -> dict[str, Any]:
         "gpu_request_mode": protocol.gpu_request_mode,
         "native_batch_required": protocol.native_batch_required,
         "job_output_dir": protocol.job_output_dir,
+        "gpu_vendor": protocol.gpu_vendor or "",
+        "preferred_storage": protocol.preferred_storage or "",
+        "home_prefix": protocol.home_prefix or "",
+        "storage_caveat": protocol.storage_caveat or "",
+        "rule_prefix": protocol.rule_prefix or "",
         "docs": list(protocol.docs),
         "notes": list(protocol.notes),
         "queues": [queue_display(queue) for queue in protocol.queues],
@@ -5013,6 +6917,16 @@ def queue_display(queue: QueueRecord) -> dict[str, Any]:
         "account": queue.account or "",
         "qos": queue.qos or "",
         "constraint": queue.constraint or "",
+        "max_time": queue.max_time or "",
+        "allowed_accounts": list(queue.allowed_accounts),
+        "denied_accounts": list(queue.denied_accounts),
+        "required_qos": queue.required_qos or "",
+        "account_required": queue.account_required,
+        "gres_types": list(queue.gres_types),
+        "gpu_only": queue.gpu_only,
+        "nodes": list(queue.nodes),
+        "evidence": queue.evidence or "",
+        "as_of": queue.as_of or "",
         "extra_directives": list(queue.extra_directives),
         "notes": list(queue.notes),
         "capabilities": dict(queue.capabilities),
@@ -5967,6 +7881,89 @@ def command_queue_list(args: argparse.Namespace, context: FleetContext) -> int:
         when_empty=f"protocol {protocol.name!r} does not define any queues",
     )
     return 0
+
+
+def resolve_protocol_for_selector(
+    context: FleetContext, selector: str | None
+) -> tuple[ProtocolRecord, str | None]:
+    """Resolve a selector to its protocol without opening a connection.
+
+    A protocol name is accepted directly so a script can be checked against a
+    site nobody is logged into -- the whole point of an offline preflight is
+    that it works from a laptop on a train.
+    """
+    normalized = context.normalize_selector(selector)
+    if normalized in context.protocols:
+        return context.protocols[normalized], None
+    target, _binding = context.resolve_target(normalized, cwd=Path.cwd())
+    return context.resolve_protocol(target), target.name
+
+
+def command_preflight(args: argparse.Namespace, context: FleetContext) -> int:
+    """Check a batch script against its site's declared policy.
+
+    Entirely local: config and the script file, no connection.  That is what
+    makes it usable as the step before `submit` rather than a slower copy of
+    it, and it is why the account matrix has to be declared in the protocol --
+    the scheduler is not there to ask.
+    """
+    local_script = Path(args.local_script).expanduser().resolve()
+    protocol, target_name = resolve_protocol_for_selector(context, args.selector)
+    if protocol.kind != "slurm":
+        raise FleetError(
+            f"protocol {protocol.name!r} is not scheduler-backed, so there are no "
+            "batch directives to check. Run the script with `fleetctl script` "
+            "instead."
+        )
+    report = preflight_script(
+        local_script,
+        protocol=protocol,
+        strict=bool(getattr(args, "strict", False)),
+        shellcheck=bool(getattr(args, "shellcheck", False)),
+    )
+    strict = bool(getattr(args, "strict", False))
+    if args.json:
+        payload = json.loads(render_preflight_json(report, str(local_script), strict=strict))
+        payload["protocol"] = protocol.name
+        if target_name:
+            payload["target"] = target_name
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(render_preflight_text(report, str(local_script), strict=strict))
+    return report.exit_code()
+
+
+def preflight_gate(
+    plan: "Plan", args: argparse.Namespace, local_script: Path
+) -> None:
+    """Refuse a submission whose script the offline checker rejects.
+
+    Placed before the connection rather than after it: a script with a
+    directive after its first command is wrong on the laptop, and finding that
+    out costs nothing, while finding it out from `squeue` two hours later costs
+    the queue slot.  Only ERROR refuses -- a warning is a decision for the
+    operator, which is what `--strict` is for.
+    """
+    if plan.protocol.kind != "slurm" or not plan.profile.submit_command:
+        return
+    if getattr(args, "no_preflight", False):
+        return
+    strict = bool(getattr(args, "strict", False))
+    report = preflight_script(
+        local_script,
+        protocol=plan.protocol,
+        strict=strict,
+    )
+    print(
+        render_preflight_text(report, str(local_script), strict=strict),
+        file=sys.stderr,
+    )
+    if report.worst_level() == LEVEL_ERROR:
+        raise FleetError(
+            f"{local_script.name} fails preflight for site {plan.protocol.name!r}; "
+            "nothing was submitted. Fix what the diagnostics above name, or rerun "
+            "with `--no-preflight` to submit it anyway."
+        )
 
 
 def command_resolve(args: argparse.Namespace, context: FleetContext) -> int:
@@ -7424,6 +9421,7 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     if not local_script.is_file():
         raise FleetError(f"missing local script: {local_script}")
     plan = build_plan(context, args, "submit")
+    preflight_gate(plan, args, local_script)
     target = plan.target
     protocol = plan.protocol
     profile = plan.profile
@@ -8075,6 +10073,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         context = None
 
     if context is not None:
+        warnings.extend(queue_evidence_warnings(context.protocols))
         referenced_secrets: set[Path] = set()
         for target in context.targets.values():
             try:
@@ -8305,6 +10304,14 @@ SYNOPSIS
     fleetctl sync push|pull <local> [<remote>] [--delete] [--force]
     fleetctl sync transfer <src>[:<path>] <dst>[:<path>] [--relay]
     fleetctl submit <file> [--queue <preset>] [--native-batch]
+    fleetctl preflight <file> --target <target> [--strict] [--json]
+
+OFFLINE VERBS
+    `preflight` opens no connection. It reads the script and the site's
+    declared policy and reports what the scheduler would reject, with a
+    stable rule ID per finding. `submit` runs it before connecting and
+    refuses on ERROR; `--no-preflight` skips it, `--strict` lets a
+    warning refuse too. Exit 0 clean, 1 warnings, 2 refused.
 
 ADMISSION VERBS
     Six subcommands are the columns of the role matrix:
@@ -8682,6 +10689,28 @@ DESCRIPTION
     `cancel_command`, `logs_command`, `job_id_pattern` and `[script]`.
     A project binding maps a local directory onto a target and a
     remote root, so a bound directory needs no --target.
+
+SITE POLICY
+    A `slurm` protocol may also declare what the scheduler will refuse,
+    so `fleetctl preflight` can refuse first. On the protocol:
+    `gpu_vendor` (nvidia|amd|intel -- the wrong smi tool reports
+    nothing rather than failing), `preferred_storage`, `home_prefix`,
+    `storage_caveat`, and `rule_prefix` for this site's diagnostic IDs.
+    On a queue: `max_time` (the scheduler's MaxTime, as opposed to
+    `time_limit`, which is what the preset requests),
+    `allowed_accounts`, `denied_accounts`, `required_qos`,
+    `account_required`, `gres_types`, `gpu_only`, and `nodes` (Slurm
+    hostlists, so a pinned `--nodelist` can be checked against the
+    partition it was paired with).
+
+    The account matrix is declared rather than discovered because
+    `sbatch --test-only` does not enforce it: a request naming an
+    account the partition does not permit passes the dry run and then
+    pends forever, with the reason visible only in `squeue`. Each
+    queue carries `evidence` (verified-by-run, verified-live,
+    documented, document-conflict, inferred) and `as_of`, so a
+    refusal states what it rests on and `doctor` can flag a
+    "verified" fact that has gone stale.
 
     A record's name is its `name` key or the file stem, and two files
     claiming one name is an error rather than a silent last-one-wins.
@@ -9163,6 +11192,29 @@ def build_parser() -> argparse.ArgumentParser:
     queue_list_parser.add_argument("--json", action="store_true", help="Emit JSON")
     queue_list_parser.set_defaults(handler=command_queue_list)
 
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Check a batch script against its site's policy, without submitting",
+    )
+    preflight_parser.add_argument("local_script", help="Local batch script to check")
+    preflight_parser.add_argument(
+        "--target",
+        dest="selector",
+        help="Target, pool, or protocol name",
+    )
+    preflight_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat warnings as errors",
+    )
+    preflight_parser.add_argument(
+        "--shellcheck",
+        action="store_true",
+        help="Also run shellcheck on the script body when it is installed",
+    )
+    preflight_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    preflight_parser.set_defaults(handler=command_preflight)
+
     resolve_parser = subparsers.add_parser("resolve", help="Resolve a selector to a target")
     resolve_parser.add_argument("selector", nargs="?", help="Target or pool name")
     resolve_parser.add_argument("--json", action="store_true", help="Emit JSON")
@@ -9496,6 +11548,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--native-batch",
         action="store_true",
         help="Submit the staged script unchanged through the scheduler profile",
+    )
+    submit_parser.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="Submit without checking the script against the site's policy first",
+    )
+    submit_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Let preflight warnings refuse the submission too",
     )
     submit_parser.add_argument("--queue", help="Queue preset name for scheduler protocols")
     submit_parser.add_argument("--job-name", help="Scheduler job name override")
