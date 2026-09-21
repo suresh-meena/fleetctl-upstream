@@ -38,13 +38,20 @@ Each GPU node is described as follows:
 The three GPU rows total 12 devices across the cluster; that is not a
 single-job allocation limit. The PDF does not define the “Processor” field,
 GPU memory capacity, GPU architecture identifier, or current allocatable
-resources. The storage-node table has inconsistent processor/memory values;
-do not use those values as inventory limits.
+resources. The storage node sn01's table includes a "504 TB system memory"
+row that is internally inconsistent with the rest of its own specification;
+do not use that figure, or any other value from the storage-node table, as
+an inventory limit.
 
 Page 2 lists Ubuntu 22.04, “ROCk drivers for MI210 GPUs 6.0.6,” Slurm 22.05.8,
 and LDAP authentication. These version descriptions are historical context;
 the PDF does not establish a complete ROCm/framework/container compatibility
 matrix.
+
+Slurm 22.05.8 predates the `--json` data_parser output later Slurm releases
+support. Live discovery on this site falls back to `scontrol show
+partitions` / `scontrol show nodes` text output instead — expected behavior
+for this version, not an error in `fleetctl`.
 
 ## Access and storage
 
@@ -52,10 +59,14 @@ Access is restricted to the institution's CSA students and faculty; student
 accounts require advisor approval and an account-validity period. The access
 instructions assume connectivity from the institutional network (p. 2).
 
-Each user receives 20 GB in their home directory. Additional temporary storage
-is cleaned weekly (p. 2). Choose project workdirs with that limit in mind and
-copy results that must persist out of temporary storage before cleanup.
-Resolve actual paths through private configuration.
+Each user receives 20 GB in their home directory, documented under
+`/rhome/<username>` (the path prefix used in the PDF's third example).
+Temporary storage under `/scratch/<username>` is cleaned WEEKLY (p. 2) —
+treat that as a hard retention bound, not a suggestion. Choose project
+workdirs with both limits in mind and copy anything that must persist out
+of `/scratch` before cleanup. Resolve actual host-specific mounts through
+private configuration; the `<username>` path prefixes above are documented
+patterns, not a confirmed mapping to any target's `workdir`.
 
 ## Scheduler examples and their limits
 
@@ -71,13 +82,21 @@ examples. The queue names and resource requests are examples, not confirmed
 current partitions, site maxima, recommended defaults, or free capacity.
 Accounts, QoS, reservations, and complete partition limits are not specified.
 
+The PDF supplies no partition table at all: `jobgn01` (the single-node
+example's partition) and `GPU` (the other two examples' partition) are
+example-only names, with no documented time limits, node ranges, accounts,
+or QOS model attached to either one. Confirm real partition names live
+rather than assuming either of these is current.
+
 Correct these source issues when preparing work:
 
 - `scancle` is a typo for `scancel` (p. 3); use `fleetctl job cancel <job-id>`
   for a tracked job.
 - `nvidia-smi` in the first GPU example is inconsistent with AMD MI210 hardware
-  (p. 3). The PDF supplies no validated AMD replacement command; determine
-  supported AMD tooling from the site's configuration and runtime.
+  (p. 3). The PDF supplies no validated AMD replacement command, but the
+  general ROCm equivalent for device queries is `rocm-smi` (or `rocminfo`);
+  confirm it is installed and on `PATH` on the login node before relying on
+  it, since the PDF itself validates no AMD tooling.
 - The example labeled multi-node supplies no node count, and its
   `--ntasks=1` comment claims eight CPUs (p. 4). Neither establishes a
   multi-node allocation or an eight-CPU request.
