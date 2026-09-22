@@ -96,16 +96,17 @@ def test_preflight_warnings_only_exits_one(fleetctl_path, fleet_config_home, tmp
         "#SBATCH --partition=medium\n"
         "#SBATCH --time=01:00:00\n"
         "#SBATCH --mem=4G\n"
-        # logs/ does not exist under tmp_path, so this is a WARN (FS003), not
-        # an ERROR -- the whole point of this fixture.
-        "#SBATCH --output=logs/%x_%j.out\n"
+        # stdout and stderr naming one file is a WARN (SLURM042) on any host,
+        # which is what this fixture needs: a warning that is not an error.
+        "#SBATCH --output=job.out\n"
+        "#SBATCH --error=job.out\n"
         "echo hello\n"
     )
     proc = run_fleetctl(
         fleetctl_path, tmp_path, fleet_config_home, "preflight", str(script), "--target", "kiac",
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "FS003" in proc.stdout
+    assert "SLURM042" in proc.stdout
 
 
 def test_preflight_error_exits_two(fleetctl_path, fleet_config_home, tmp_path):
@@ -154,7 +155,8 @@ def test_preflight_strict_escalates_to_two(fleetctl_path, fleet_config_home, tmp
         "#SBATCH --partition=medium\n"
         "#SBATCH --time=01:00:00\n"
         "#SBATCH --mem=4G\n"
-        "#SBATCH --output=logs/%x_%j.out\n"
+        "#SBATCH --output=job.out\n"
+        "#SBATCH --error=job.out\n"
         "echo hello\n"
     )
     plain = run_fleetctl(

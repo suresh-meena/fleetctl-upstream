@@ -167,7 +167,7 @@ def test_fs_invalid_workdir(fleetctl):
     rep = fleetctl.Report()
     fleetctl.check_filesystem(script, rep)
     fs1 = [d for d in rep.items if d.rule_id == "FS001"]
-    assert fs1 and fs1[0].level == "ERROR"
+    assert fs1 and fs1[0].level == "INFO"
     assert fs1[0].line is not None
 
 
@@ -180,7 +180,7 @@ def test_fs003_output_dir_missing(fleetctl, tmp_path):
     rep = fleetctl.Report()
     fleetctl.check_filesystem(script, rep)
     fs3 = [d for d in rep.items if d.rule_id == "FS003"]
-    assert fs3 and fs3[0].level == "WARN"
+    assert fs3 and fs3[0].level == "INFO"
     (tmp_path / "out").mkdir()
     rep2 = fleetctl.Report()
     fleetctl.check_filesystem(script, rep2)

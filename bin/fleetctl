@@ -2540,14 +2540,24 @@ def _check_task_geometry(script: ParsedScript, rep: Report) -> None:
 
 
 def check_filesystem(script: ParsedScript, rep: Report) -> None:
+    """Report paths the script names that do not exist on this machine.
+
+    Informational only, never a refusal.  fleetctl checks a script on the
+    machine it is typed on and runs it on another one, so `/storage/...`
+    missing here says nothing about the cluster -- and when these were errors,
+    every job with an absolute cluster path was refused, which left
+    `--no-preflight` as the only way through and switched the account checks
+    off with them.  They stay as hints because a typo in a path the operator
+    also has locally is still worth pointing at.
+    """
     chdir = script.get("--chdir")
     if chdir:
         target = os.path.expanduser(chdir)
         if os.path.isabs(target) and not os.path.isdir(target):
             chdir_d = script.directive_for("--chdir")
-            rep.error(
+            rep.info(
                 "FS001",
-                f"--chdir target does not exist on this host: {target}",
+                f"--chdir target does not exist on this machine: {target}",
                 line=chdir_d.line_no if chdir_d else None,
                 excerpt=chdir_d.raw if chdir_d else None,
                 suggestion="create it, or point at the recommended storage area",
@@ -2560,9 +2570,9 @@ def check_filesystem(script: ParsedScript, rep: Report) -> None:
         if target.startswith("$") or not os.path.isabs(target):
             continue
         if not os.path.isdir(target):
-            rep.error(
+            rep.info(
                 "FS001",
-                f"cd target does not exist on this host: {target}",
+                f"cd target does not exist on this machine: {target}",
                 line=line_no,
                 excerpt=text,
             )
@@ -2575,9 +2585,9 @@ def check_filesystem(script: ParsedScript, rep: Report) -> None:
             # sbatch requires the output directory to exist at submit time,
             # even when the filename itself uses %j-style patterns
             if not os.path.isdir(_resolve_exists_dir(dirpart, chdir, script.path)):
-                rep.warn(
+                rep.info(
                     "FS003",
-                    f"directory for {option} does not exist yet: {dirpart}",
+                    f"directory for {option} does not exist on this machine: {dirpart}",
                     line=directive.line_no,
                     suggestion=f"mkdir -p {dirpart} in the submission directory before "
                     "submitting (sbatch opens output files at submit time)",
@@ -2589,16 +2599,16 @@ def check_filesystem(script: ParsedScript, rep: Report) -> None:
         exe = words[0]
         if "/" in exe:
             if not _resolve_exists(exe, chdir, script.path):
-                rep.error(
+                rep.info(
                     "FS002",
-                    f"executable path does not exist: {exe}",
+                    f"executable path does not exist on this machine: {exe}",
                     line=line_no,
                     excerpt=text,
                 )
         elif shutil.which(exe) is None:
-            rep.warn(
+            rep.info(
                 "FS002",
-                f"command '{exe}' not found on this host; fine if a module provides it on the cluster",
+                f"command '{exe}' not found on this machine; fine if it exists where the job runs",
                 line=line_no,
                 excerpt=text,
                 confidence=CONF_INFERRED,
@@ -2606,9 +2616,9 @@ def check_filesystem(script: ParsedScript, rep: Report) -> None:
         if words[0] in ("python", "python3", "python2") and len(words) > 1:
             arg = words[1]
             if arg.startswith(("./", "../", "/")) and not _resolve_exists(arg, chdir, script.path):
-                rep.warn(
+                rep.info(
                     "FS002",
-                    f"script argument not found: {arg}",
+                    f"script argument not found on this machine: {arg}",
                     line=line_no,
                     excerpt=text,
                     confidence=CONF_INFERRED,
@@ -3210,6 +3220,7 @@ def preflight_script(
     protocol: ProtocolRecord,
     strict: bool = False,
     shellcheck: bool = False,
+    check_paths: bool = True,
 ) -> Report:
     """Run the full offline batch-script preflight and return its Report.
 
@@ -3227,7 +3238,8 @@ def preflight_script(
     check_structure(script, rep)
     check_shell(str(path), rep, shellcheck=("on" if shellcheck else "off"))
     check_generic(script, rep)
-    check_filesystem(script, rep)
+    if check_paths:
+        check_filesystem(script, rep)
     check_modules(script, rep)
     if protocol.kind == "slurm":
         check_site_policy(script, rep, protocol)
@@ -8069,15 +8081,29 @@ def preflight_gate(
     if getattr(args, "no_preflight", False):
         return
     strict = bool(getattr(args, "strict", False))
-    report = preflight_script(
-        local_script,
-        protocol=plan.protocol,
-        strict=strict,
-    )
-    print(
-        render_preflight_text(report, str(local_script), strict=strict),
-        file=sys.stderr,
-    )
+    if getattr(args, "native_batch", False):
+        # The script goes to sbatch unchanged, so the script is what to check.
+        report = preflight_script(local_script, protocol=plan.protocol, strict=strict)
+        label = str(local_script)
+    elif plan.queue is None:
+        # A protocol that insists on --native-batch, reached without it:
+        # command_submit refuses with the message that actually applies.
+        return
+    else:
+        # The payload is run by the wrapper and never read by sbatch; the
+        # wrapper carries every directive, so it is the thing to check.  Its
+        # own paths are fleetctl's, not the operator's, so they are not.
+        wrapper = render_submit_wrapper(
+            plan, args, local_script, planned_script_path(plan.profile, local_script)
+        )
+        with tempfile.TemporaryDirectory(prefix="fleetctl-preflight-") as scratch:
+            rendered = Path(scratch) / f"{local_script.stem}.wrapper.sbatch"
+            rendered.write_text(wrapper.text, encoding="utf-8")
+            report = preflight_script(
+                rendered, protocol=plan.protocol, strict=strict, check_paths=False
+            )
+        label = f"{local_script.name} as wrapped for queue {plan.queue.name!r}"
+    print(render_preflight_text(report, label, strict=strict), file=sys.stderr)
     if report.worst_level() == LEVEL_ERROR:
         raise FleetError(
             f"{local_script.name} fails preflight for site {plan.protocol.name!r}; "
@@ -9535,6 +9561,59 @@ def command_sync_transfer(
     )
 
 
+@dataclass(frozen=True)
+class SubmitWrapper:
+    """The batch script fleetctl generates around a payload, and its paths."""
+
+    text: str
+    job_name: str
+    output_dir: str | None
+    output_path: str | None
+    error_path: str | None
+
+
+def render_submit_wrapper(
+    plan: "Plan",
+    args: argparse.Namespace,
+    local_script: Path,
+    remote_script: str,
+) -> SubmitWrapper:
+    """Render the wrapper `submit` hands to the scheduler on the queue path.
+
+    One function for both callers -- `submit` itself and the preflight gate in
+    front of it -- because the gate is only worth anything if it checks the
+    text the scheduler will actually receive.  Linting the payload instead is
+    how a correct `submit --queue a100` got refused for having no
+    `--partition`: the payload never has one, the wrapper always does.  Pure:
+    no connection, no remote I/O, so the gate can run it before connecting.
+    """
+    protocol, profile, queue = plan.protocol, plan.profile, plan.queue
+    output_dir, output_path, error_path = resolve_job_output_paths(
+        protocol,
+        base_root=protocol_base_root(plan.target, plan.binding, args.cwd),
+        output_override=args.output,
+        error_override=args.error,
+    )
+    job_name = sanitize_job_name(args.job_name or local_script.stem)
+    text = render_slurm_wrapper(
+        protocol=protocol,
+        remote_script=remote_script,
+        script_args=args.script_args,
+        interpreter=args.interpreter or profile.interpreter,
+        environment=profile.environment,
+        cwd=plan.cwd,
+        queue=queue,
+        job_name=job_name,
+        time_limit=args.time,
+        gpus=args.gpus,
+        cpus_per_task=args.cpus_per_task,
+        mem=args.mem,
+        output_path=output_path,
+        error_path=error_path,
+    )
+    return SubmitWrapper(text, job_name, output_dir, output_path, error_path)
+
+
 def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     """Submit or launch a script according to its profile."""
     local_script = Path(args.local_script).expanduser().resolve()
@@ -9645,32 +9724,15 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             ssh_runtime=ssh_runtime,
         )
     )
-    job_base_root = protocol_base_root(target, plan.binding, args.cwd)
-    output_dir, output_path, error_path = resolve_job_output_paths(
-        protocol,
-        base_root=job_base_root,
-        output_override=args.output,
-        error_override=args.error,
+    wrapper = render_submit_wrapper(plan, args, local_script, remote_script)
+    output_dir, output_path, error_path = (
+        wrapper.output_dir,
+        wrapper.output_path,
+        wrapper.error_path,
     )
+    job_name, wrapper_text = wrapper.job_name, wrapper.text
     if output_dir and not args.dry_run:
         ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
-    job_name = sanitize_job_name(args.job_name or local_script.stem)
-    wrapper_text = render_slurm_wrapper(
-        protocol=protocol,
-        remote_script=remote_script,
-        script_args=args.script_args,
-        interpreter=args.interpreter or profile.interpreter,
-        environment=profile.environment,
-        cwd=cwd,
-        queue=queue,
-        job_name=job_name,
-        time_limit=args.time,
-        gpus=args.gpus,
-        cpus_per_task=args.cpus_per_task,
-        mem=args.mem,
-        output_path=output_path,
-        error_path=error_path,
-    )
     if args.dry_run:
         # The whole point of a submit dry run: read the wrapper the scheduler
         # would receive, before it receives it.

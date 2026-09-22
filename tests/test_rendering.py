@@ -145,5 +145,5 @@ def test_inferred_confidence_on_unresolvable_command(fleetctl):
     rep = fleetctl.Report()
     fleetctl.check_filesystem(script, rep)
     diag = [d for d in rep.items if d.rule_id == "FS002"][0]
-    assert diag.level == "WARN"
+    assert diag.level == "INFO"
     assert diag.confidence == fleetctl.CONF_INFERRED

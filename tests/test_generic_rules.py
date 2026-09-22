@@ -89,9 +89,9 @@ def test_valid_gpu_script_passes_offline(fleetctl, kiac_protocol):
     assert "SH001" in ids(rep)
     assert "KIAC010" in ids(rep)
     assert not rep.errors
-    # logs/ does not exist relative to the fixture dir, so FS003 still fires
-    # as a WARN; under the new exit-code formula that alone makes exit 1.
-    assert rep.exit_code() == 1
+    # logs/ does not exist beside the fixture, but that is a fact about this
+    # machine, not the cluster, so it is INFO and a valid script exits clean.
+    assert rep.exit_code() == 0
 
 
 def test_shell_syntax_error(fleetctl, kiac_protocol):
@@ -260,12 +260,13 @@ def test_fs001_chdir_does_not_exist(fleetctl):
     rep = fleetctl.Report()
     fleetctl.check_filesystem(script, rep)
     fs1 = [d for d in rep.items if d.rule_id == "FS001"]
-    assert fs1 and fs1[0].level == "ERROR"
+    # Host-relative: informational, never a refusal.
+    assert fs1 and fs1[0].level == "INFO"
 
 
 def test_fs002_missing_executable_path(fleetctl):
     script = fleetctl.parse_text("#!/bin/bash\n/no/such/binary --flag\n")
     rep = fleetctl.Report()
     fleetctl.check_filesystem(script, rep)
-    fs2 = [d for d in rep.items if d.rule_id == "FS002" and d.level == "ERROR"]
+    fs2 = [d for d in rep.items if d.rule_id == "FS002" and d.level == "INFO"]
     assert fs2
