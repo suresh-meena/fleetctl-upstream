@@ -79,16 +79,19 @@ SchedMD pages — over general tutorials.
 ## Scheduler sites
 
 Before submitting to any Slurm-backed target, run the offline linter:
-`fleetctl preflight <script> --target <target> [--live] [--strict]
-[--json]`. `fleetctl submit` runs the same preflight automatically and
-refuses to submit on ERROR — treat that refusal as the answer, not an
-obstacle to route around.
+`fleetctl preflight <script> --target <target> [--strict] [--json]`.
+`fleetctl submit` runs the same preflight automatically and refuses to
+submit on ERROR — treat that refusal as the answer, not an obstacle to
+route around.
 
-- `sbatch --test-only` (what a `--live` preflight falls back on) validates
-  syntax and allocation shape only. It does **not** enforce account,
-  partition, or QOS policy — a job can pass the dry run cleanly and then
-  pend forever once the scheduler applies its association matrix (verified
-  on KIAC, 2026-09-14). A green preflight is necessary, not sufficient.
+- `preflight` is offline: it never contacts the scheduler, which is why
+  the account and QOS matrix has to be declared on the queue for it to be
+  checked at all. The reason that is worth doing rather than deferring to
+  the cluster: `sbatch --test-only` validates syntax and allocation shape
+  only. It does **not** enforce account, partition, or QOS policy — a job
+  can pass the dry run cleanly and then pend forever once the scheduler
+  applies its association matrix (verified on KIAC, 2026-09-14). A green
+  preflight is necessary, not sufficient.
 - After any newly granted account/partition/QOS combination, validate it
   with a real 5-minute smoke job before relying on it for real work —
   `--test-only` and preflight cannot substitute for a run that actually

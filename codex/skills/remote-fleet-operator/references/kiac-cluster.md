@@ -57,8 +57,8 @@ claims by origin, newest evidence first:
 - **The `sbatch --test-only` blind spot** (`verified-live`): it validates
   syntax and allocation shape only. It does not enforce account-partition
   or QOS policy, so a job can pass the dry run and then pend forever once
-  the scheduler applies its association matrix. A green dry run (or a
-  green `fleetctl preflight --live`) is necessary, not sufficient — after
+  the scheduler applies its association matrix. A green dry run, or a green
+  `fleetctl preflight`, is necessary but not sufficient — after
   any newly granted account/partition/QOS combination, confirm it with a
   real 5-minute smoke job before relying on it, e.g. `sbatch
   --account=... --partition=... --gres=gpu:1 --time=00:05:00
