@@ -58,7 +58,7 @@ claims by origin, newest evidence first:
   syntax and allocation shape only. It does not enforce account-partition
   or QOS policy, so a job can pass the dry run and then pend forever once
   the scheduler applies its association matrix. A green dry run, or a green
-  `fleetctl preflight`, is necessary but not sufficient — after
+  `fleetctl preflight --live`, is necessary but not sufficient — after
   any newly granted account/partition/QOS combination, confirm it with a
   real 5-minute smoke job before relying on it, e.g. `sbatch
   --account=... --partition=... --gres=gpu:1 --time=00:05:00

@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per finding (`SH*` shell, `SLURM*` generic semantics, `FS*`, `MOD*`, and the
   site's own `rule_prefix`, e.g. `KIAC023`). `submit` runs it before opening a
   connection and refuses on ERROR; `--no-preflight` skips it and `--strict`
-  lets a warning refuse too. Exit 0 clean, 1 warnings, 2 refused. Ported from
-  the standalone `slurm-helper` skill, which this replaces.
+  lets a warning refuse too, and `--live` adds an `sbatch --test-only` dry run
+  on the target, admitted as `submit` is and skipped when the offline checks
+  already failed. Exit 0 clean, 1 warnings, 2 refused. Ported from the
+  standalone `slurm-helper` skill, which this replaces.
 - Site policy as declared config, so the preflight can enforce what
   `sbatch --test-only` will not: per queue, `max_time`, `allowed_accounts`,
   `denied_accounts`, `required_qos`, `account_required`, `gres_types`,

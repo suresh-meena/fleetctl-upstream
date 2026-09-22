@@ -7908,7 +7908,19 @@ def command_preflight(args: argparse.Namespace, context: FleetContext) -> int:
     the scheduler is not there to ask.
     """
     local_script = Path(args.local_script).expanduser().resolve()
-    protocol, target_name = resolve_protocol_for_selector(context, args.selector)
+    live = bool(getattr(args, "live", False))
+    if live:
+        # --live reaches a host, so it takes the plan (and with it the role
+        # matrix) rather than the bare protocol lookup the offline path uses.
+        # native_batch, because --test-only must judge the script as written.
+        args.audited = True
+        args.native_batch = True
+        plan = build_plan(context, args, "submit")
+        protocol = plan.protocol
+        target_name = plan.target.name
+    else:
+        plan = None
+        protocol, target_name = resolve_protocol_for_selector(context, args.selector)
     if protocol.kind != "slurm":
         raise FleetError(
             f"protocol {protocol.name!r} is not scheduler-backed, so there are no "
@@ -7921,6 +7933,18 @@ def command_preflight(args: argparse.Namespace, context: FleetContext) -> int:
         strict=bool(getattr(args, "strict", False)),
         shellcheck=bool(getattr(args, "shellcheck", False)),
     )
+    # Only after the offline rules pass: a script the local checker rejects has
+    # no business costing a connection and a staged file on a login node.
+    if live and report.worst_level() != LEVEL_ERROR:
+        live_test_only(plan, local_script, report)
+        if bool(getattr(args, "strict", False)):
+            report.escalate_warnings()
+    elif live:
+        report.info(
+            "LIVE000",
+            "skipped the scheduler dry run: the offline checks already failed, "
+            "and --test-only cannot tell you anything they have not",
+        )
     strict = bool(getattr(args, "strict", False))
     if args.json:
         payload = json.loads(render_preflight_json(report, str(local_script), strict=strict))
@@ -7931,6 +7955,102 @@ def command_preflight(args: argparse.Namespace, context: FleetContext) -> int:
     else:
         print(render_preflight_text(report, str(local_script), strict=strict))
     return report.exit_code()
+
+
+LIVE_TEST_TIMEOUT = 120.0
+
+
+def live_test_only(
+    plan: "Plan", local_script: Path, rep: Report
+) -> None:
+    """Ask the scheduler whether it would accept this script, without submitting.
+
+    `sbatch --test-only` is the only check here that is not local, and it is
+    deliberately the last one: it costs a connection and a staged file, and it
+    answers a narrower question than its name suggests.  It validates syntax
+    and whether the allocation could ever be satisfied.  It does NOT apply the
+    account, partition or QOS association matrix, so a request from a denied
+    account comes back clean and then pends forever -- which is why the offline
+    rules check that matrix from declared data and why LIVE002 says so out loud
+    next to a green result.
+
+    Admission rides `submit`: this runs sbatch on the submission surface, and
+    asking whether a submission would be accepted must never be possible where
+    submitting is refused, or it becomes a way to run sbatch on a role that
+    forbids it.
+    """
+    profile = plan.profile
+    if not profile.submit_command:
+        raise FleetError(
+            f"profile {profile.name!r} does not submit through a scheduler, so "
+            "there is nothing to dry-run; drop --live"
+        )
+    # Rather than splice a flag into an arbitrary submit_command and hope the
+    # result means the same thing, refuse anything this does not recognise. A
+    # wrapper like `apptainer exec ... sbatch` would take --test-only in a
+    # position this cannot guess, and guessing wrong submits the job for real.
+    if Path(profile.submit_command[0]).name != "sbatch":
+        raise FleetError(
+            f"--live knows how to dry-run `sbatch`, but profile {profile.name!r} "
+            f"submits with {shlex.join(profile.submit_command)}. Check the script "
+            "offline and submit it when you are ready."
+        )
+
+    ssh_runtime = plan.connect()
+    remote_script = stage_remote_script(
+        plan.secret, profile, local_script, ssh_runtime=ssh_runtime
+    )
+    argv = render_template_values(
+        (profile.submit_command[0], "--test-only", *profile.submit_command[1:]),
+        script_path=remote_script,
+        workdir=plan.cwd,
+    )
+    try:
+        completed = run_ssh_command(
+            plan.secret,
+            allocate_tty=False,
+            remote_command=remote_shell_command(argv, cwd=plan.cwd),
+            capture_output=True,
+            timeout=LIVE_TEST_TIMEOUT,
+            **ssh_runtime,
+        )
+    finally:
+        # The staged copy has served its purpose either way, and leaving one
+        # scratch file per dry run on a login node is how a quota disappears.
+        run_ssh_command(
+            plan.secret,
+            allocate_tty=False,
+            remote_command=remote_shell_command(["rm", "-f", remote_script]),
+            capture_output=True,
+            timeout=LIVE_TEST_TIMEOUT,
+            **ssh_runtime,
+        )
+
+    detail = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    if completed.returncode == 0:
+        rep.pass_(
+            "LIVE001",
+            f"the scheduler on {plan.target.name!r} accepted this script as a dry "
+            "run (nothing was submitted)",
+            excerpt=detail or None,
+            confidence=CONF_VERIFIED_LIVE,
+        )
+        rep.info(
+            "LIVE002",
+            "a clean --test-only does not prove the account, partition and QOS "
+            "combination is permitted: the scheduler applies that matrix at "
+            "scheduling time, not at submission. Confirm a new combination with a "
+            "real five-minute job.",
+            confidence=CONF_VERIFIED_LIVE,
+        )
+        return
+    rep.error(
+        "LIVE003",
+        f"the scheduler on {plan.target.name!r} rejected this script "
+        f"(sbatch --test-only exited {completed.returncode})",
+        excerpt=detail or None,
+        confidence=CONF_VERIFIED_LIVE,
+    )
 
 
 def preflight_gate(
@@ -10304,14 +10424,23 @@ SYNOPSIS
     fleetctl sync push|pull <local> [<remote>] [--delete] [--force]
     fleetctl sync transfer <src>[:<path>] <dst>[:<path>] [--relay]
     fleetctl submit <file> [--queue <preset>] [--native-batch]
-    fleetctl preflight <file> --target <target> [--strict] [--json]
+    fleetctl preflight <file> --target <target> [--live] [--strict]
 
-OFFLINE VERBS
-    `preflight` opens no connection. It reads the script and the site's
-    declared policy and reports what the scheduler would reject, with a
-    stable rule ID per finding. `submit` runs it before connecting and
-    refuses on ERROR; `--no-preflight` skips it, `--strict` lets a
-    warning refuse too. Exit 0 clean, 1 warnings, 2 refused.
+PREFLIGHT
+    `preflight` reads the script and the site's declared policy and
+    reports what the scheduler would reject, with a stable rule ID per
+    finding. It opens no connection unless asked. `submit` runs it
+    before connecting and refuses on ERROR; --no-preflight skips it,
+    --strict lets a warning refuse too. Exit 0 clean, 1 warnings, 2
+    refused.
+
+    --live adds `sbatch --test-only` on the target: it stages a copy,
+    dry-runs it, removes the copy and submits nothing. It is admitted
+    as `submit` is, so it cannot reach a host that refuses submission,
+    and it is skipped when the offline checks already failed. A clean
+    --test-only is not account or QOS proof -- the scheduler applies
+    that matrix at scheduling time, which is why the matrix is declared
+    on the queue and checked offline.
 
 ADMISSION VERBS
     Six subcommands are the columns of the role matrix:
@@ -11202,6 +11331,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="selector",
         help="Target, pool, or protocol name",
     )
+    preflight_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Also ask the scheduler with `sbatch --test-only` (submits nothing)",
+    )
+    preflight_parser.add_argument("--profile", help="Execution profile override")
+    preflight_parser.add_argument("--cwd", help="Remote working directory override")
+    add_route_flag(preflight_parser)
     preflight_parser.add_argument(
         "--strict",
         action="store_true",
