@@ -5145,7 +5145,61 @@ def ensure_target_enabled(target: TargetRecord) -> TargetRecord:
     return target
 
 
-UNSAFE_SYNC_DELETE_ROOTS = frozenset({"", ".", "..", "~", "/", "*", "$HOME"})
+UNSAFE_SYNC_DELETE_ROOTS = frozenset({"", ".", "..", "~", "/", "*"})
+# Directories whose immediate children are home directories.  `/rhome` is the
+# AMD site's; the rest are the usual Linux and macOS layouts.
+HOME_DIRECTORY_ROOTS = ("/home", "/Users", "/rhome", "/export/home")
+
+
+def normalize_remote_path(path: str) -> tuple[str, str]:
+    """Reduce a remote path to (anchor, normalized path) for comparison.
+
+    The anchor is "~" for a home-relative path, "/" for an absolute one, and
+    "." for one still relative to nothing.  Normalizing is the point: `~/.`,
+    `/home/u/`, `/home/u/work/..` and `../..` from a project root are all
+    spellings, and a guard that compares spellings refuses `~` and allows
+    `~/.`, which is the same directory.
+    """
+    if path == "~" or path.startswith("~/"):
+        return "~", posixpath.normpath(path[2:] or ".")
+    if path.startswith("/"):
+        # normpath keeps a leading `//` (POSIX leaves it implementation-defined);
+        # no host this tool reaches gives it a meaning, so collapse it.
+        return "/", "/" + posixpath.normpath(path).lstrip("/")
+    return ".", posixpath.normpath(path)
+
+
+def remote_path_is_within(path: tuple[str, str], other: tuple[str, str]) -> bool:
+    """True when normalized PATH is OTHER or lies inside it."""
+    if path[0] != other[0]:
+        return False
+    if path[1] == other[1] or other[1] in ("/", "."):
+        return True
+    return path[1].startswith(other[1].rstrip("/") + "/")
+
+
+def unsafe_delete_reason(anchor: str, normalized: str) -> str | None:
+    """Why `--delete` against this path would be refused outright, if it would."""
+    if anchor == "~":
+        if normalized == ".":
+            return "that is the whole home directory"
+        if normalized == ".." or normalized.startswith("../"):
+            return "that is above the home directory"
+        return None
+    if anchor == "/":
+        parts = [part for part in normalized.split("/") if part]
+        if not parts:
+            return "that is the root directory"
+        if len(parts) == 1:
+            return f"that is the top-level directory {normalized!r}"
+        if normalized == "/root" or (
+            len(parts) == 2 and f"/{parts[0]}" in HOME_DIRECTORY_ROOTS
+        ):
+            return f"{normalized!r} is a home directory"
+        return None
+    if normalized in UNSAFE_SYNC_DELETE_ROOTS or normalized.startswith("../"):
+        return "a relative path with no project root to anchor it names nothing definite"
+    return None
 
 
 def ensure_sync_delete_allowed(
@@ -5155,20 +5209,49 @@ def ensure_sync_delete_allowed(
     direction: str,
     force: bool,
 ) -> None:
-    """Refuse `--delete` where a mistake would erase a whole home directory."""
-    normalized = remote_path.rstrip("/")
-    if normalized in UNSAFE_SYNC_DELETE_ROOTS:
+    """Refuse `--delete` where a mistake would erase a whole home directory.
+
+    `rsync --delete` removes everything at the destination that the source
+    lacks, so the destination is the whole question.  It is decided on what the
+    path *names* after normalization, never on how it was typed: the version of
+    this that matched literal spellings refused `~` and allowed `~/.`,
+    `/home/<user>`, and `../..` from a project root -- each of which is a home
+    directory.  --force does not lift these; it exists for the workdir, below.
+    """
+    if any(marker in remote_path for marker in ("$", "`")):
+        raise FleetError(
+            f"refusing `--delete` against {remote_path!r} on {target.name!r}: a "
+            "shell variable is expanded, or not, by the remote side, so what it "
+            "names cannot be checked from here. Spell the path out."
+        )
+    if remote_path.strip() in UNSAFE_SYNC_DELETE_ROOTS:
         raise FleetError(
             f"refusing `--delete` against remote path {remote_path!r} on "
             f"{target.name!r}: that is a whole home or root directory, not a "
             "project directory"
         )
-    if target.workdir and normalized == target.workdir.rstrip("/") and not force:
+    anchor, normalized = normalize_remote_path(remote_path)
+    reason = unsafe_delete_reason(anchor, normalized)
+    if reason:
         raise FleetError(
-            f"refusing `--delete` against the host-level workdir {target.workdir!r} "
-            f"on {target.name!r}; sync a project path instead, or pass --force if you "
-            "really mean the entire workdir"
+            f"refusing `--delete` against remote path {remote_path!r} on "
+            f"{target.name!r}: {reason}, not a project directory"
         )
+    if target.workdir:
+        path = (anchor, normalized)
+        workdir = normalize_remote_path(target.workdir)
+        if path != workdir and remote_path_is_within(workdir, path):
+            raise FleetError(
+                f"refusing `--delete` against {remote_path!r} on {target.name!r}: "
+                f"it contains the host-level workdir {target.workdir!r}, so it is "
+                "broader than any one project"
+            )
+        if path == workdir and not force:
+            raise FleetError(
+                f"refusing `--delete` against the host-level workdir {target.workdir!r} "
+                f"on {target.name!r}; sync a project path instead, or pass --force if you "
+                "really mean the entire workdir"
+            )
     if direction == "pull" and not force:
         raise FleetError(
             "`sync pull --delete` removes local files that are missing on the remote, "

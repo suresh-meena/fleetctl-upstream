@@ -93,6 +93,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `setup.sh` queue bootstrap when the USB printer is connected.
 - OpenClaw home service autostart for mileva.
 ### Fixed
+- `sync --delete` now refuses by what a path names, not how it is spelled. It
+  refused `~` and `$HOME` but allowed `~/.`, `/home/<user>`, `/home/u/work/..`
+  and `../..` from a project root -- each a whole home directory, which
+  `rsync --delete` would empty. Paths are normalized first; the root, any
+  top-level directory, any home directory, and anything containing the target's
+  workdir are refused even with `--force`, which now lifts only the workdir
+  itself. A path holding a shell variable is refused, since the remote side
+  decides what it expands to. This newly refuses `--delete --force` against a
+  workdir that *is* a home directory.
 - `fleetctl exec` now reports a remote command killed by a signal as `128+N`
   (143 for SIGTERM, 137 for SIGKILL, 130 for SIGINT), matching `sh` and `ssh`,
   instead of the truncated `SystemExit` values 241/247 that read as unknown
