@@ -8194,6 +8194,15 @@ def render_slurm_wrapper(
         lines.append(f"#SBATCH --error={error_path}")
     for directive in queue.extra_directives:
         lines.append(f"#SBATCH {directive}")
+    # A line break inside any value would end its #SBATCH line and start
+    # another directive that sbatch obeys, so refuse rather than render it.
+    for line in lines:
+        if line.startswith("#SBATCH") and any(char in line for char in "\r\n\0"):
+            name = line.split("=", 1)[0].removeprefix("#SBATCH ")
+            raise FleetError(
+                f"`{name}` contains a line break; sbatch would read the rest as "
+                "new directives"
+            )
     lines.extend(
         [
             "",
@@ -10976,8 +10985,6 @@ def _json_sync(args: argparse.Namespace, context: FleetContext) -> int:
         secret = plan.secret
         byte_cost = central_sync_budget_bytes(args, plan)
         enforce_control_budget(plan, args, "sync", byte_cost=byte_cost)
-        if byte_cost is not None:
-            verify_sync_source_within_budget(args, byte_cost)
         default_remote = (
             resolve_remote_path(args.remote_path, base=plan.cwd)
             if args.remote_path
@@ -11050,6 +11057,11 @@ def _json_sync(args: argparse.Namespace, context: FleetContext) -> int:
             # a local simulation, so it is still the "primary command sent"
             # below rather than an early, unconnected return.
             command[1:1] = ["--dry-run", "--itemize-changes"]
+        if byte_cost is not None:
+            # Last look before rsync reads the tree: the connect, delete guard
+            # and mkdir above can take seconds, and the budget covers only
+            # the size that was billed.
+            verify_sync_source_within_budget(args, byte_cost)
         stdout_limit, stderr_limit = _capture_limits(args)
         attempt.sent = True
         completed = run_command(
@@ -11103,8 +11115,6 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
     # is not exempted from the budget check below.
     byte_cost = central_sync_budget_bytes(args, plan)
     enforce_control_budget(plan, args, "sync", byte_cost=byte_cost)
-    if byte_cost is not None:
-        verify_sync_source_within_budget(args, byte_cost)
     # Both of these are decidable from the inventory alone -- `plan.cwd` is
     # resolved during plan construction, and the guard compares against the
     # target's declared `workdir` -- so they belong above `connect()`. A refusal
@@ -11206,6 +11216,9 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         # its way out before it starts, or a piped run interleaves them.
         sys.stdout.flush()
 
+    if byte_cost is not None:
+        # Last look before rsync reads the tree; see _json_sync.
+        verify_sync_source_within_budget(args, byte_cost)
     completed = run_command(command, env=ssh_env(secret))
     return completed.returncode
 

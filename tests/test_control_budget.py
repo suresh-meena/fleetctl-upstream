@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -651,3 +652,34 @@ def test_fanout_exec_is_charged_per_target(fleetctl_path, budget_sandbox):
     assert proc.returncode != 0, proc.stdout + proc.stderr
     assert "control budget" in (proc.stdout + proc.stderr)
     assert not any(sockets.iterdir()), "a budget refusal opened a connection"
+
+
+def test_sync_source_growth_during_connect_is_refused_before_rsync(fleetctl, monkeypatch, tmp_path):
+    """The byte budget is re-checked just before rsync, after the connect."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a").write_bytes(b"x" * 10)
+
+    def connect():
+        (source / "b").write_bytes(b"y" * 4096)  # grows while the route comes up
+        return {}
+
+    plan = SimpleNamespace(
+        target=SimpleNamespace(name="gpu1", workdir="/work"),
+        secret=SimpleNamespace(target="gpu1"), cwd="/work", binding=None, connect=connect,
+    )
+    monkeypatch.setattr(fleetctl, "build_plan", lambda *_args: plan)
+    monkeypatch.setattr(fleetctl, "central_sync_budget_bytes", lambda *_args: 100)
+    monkeypatch.setattr(fleetctl, "enforce_control_budget", lambda *_args, **_kw: None)
+    monkeypatch.setattr(fleetctl, "run_ssh_command",
+                        lambda *_args, **_kw: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(fleetctl, "build_rsync_transport", lambda *_args, **_kw: "ssh")
+    monkeypatch.setattr(fleetctl, "ssh_env", lambda *_args: {})
+    monkeypatch.setattr(fleetctl, "run_command",
+                        lambda *_args, **_kw: pytest.fail("rsync ran over its budget"))
+    args = SimpleNamespace(
+        json=False, compress_level=0, direction="push", local_path=str(source),
+        remote_path=None, delete=False, force=False, dry_run=False,
+    )
+    with pytest.raises(fleetctl.FleetError, match="grew to"):
+        fleetctl.command_sync(args, object())

@@ -258,3 +258,15 @@ def test_dry_run_reports_the_payload_as_inlined_not_staged(fleetctl_path, sandbo
     assert "(inlined into wrapper)" in proc.stdout
     assert "FLEETCTL_PAYLOAD_" in proc.stdout
     assert not any(sockets.iterdir()), "a dry run opened a connection"
+
+
+@pytest.mark.parametrize("field", ["output_path", "error_path", "account", "qos", "time_limit", "mem"])
+def test_a_line_break_in_a_directive_value_is_refused(fleetctl, field):
+    values = dict(time_limit=None, mem=None, output_path=None, error_path=None, account=None, qos=None)
+    values[field] = "x\n#SBATCH --dependency=afterok:99999"
+    with pytest.raises(fleetctl.FleetError, match="line break"):
+        fleetctl.render_slurm_wrapper(
+            protocol=make_protocol(fleetctl), remote_script="/s", script_args=[], interpreter="bash",
+            environment={}, cwd=None, queue=make_queue(fleetctl, name="q", partition="q"),
+            job_name="job", gpus=None, cpus_per_task=None, **values,
+        )

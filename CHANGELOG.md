@@ -121,6 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `setup.sh` queue bootstrap when the USB printer is connected.
 - OpenClaw home service autostart for mileva.
 ### Fixed
+- A line break in any `#SBATCH` value (`--output`, `--account`, and so on) is
+  refused instead of being rendered as further directives.
+- The sync byte-budget recheck runs just before rsync, so a source that grows
+  while the connection comes up is refused rather than sent over budget.
 - `exec --all`/`--tag` now honour `--timeout`: fan-out worker threads did not
   inherit the deadline, so one unresponsive host could hang the whole run.
 - The submit gate reads GPU requests as Slurm does. `-G` is `--gpus`,
