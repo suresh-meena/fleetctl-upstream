@@ -21,6 +21,8 @@ the prefix is not hardcoded anywhere in the engine.
 
 from __future__ import annotations
 
+import pytest
+
 from _helpers import make_protocol, make_queue
 
 
@@ -598,3 +600,22 @@ def test_slurm_protocol_runs_site_rules_too(fleetctl, tmp_path):
     script_path.write_text("#!/bin/bash\n#SBATCH --partition=medium\necho hi\n")
     rep = fleetctl.preflight_script(script_path, protocol=protocol)
     assert "KIAC010" in ids(rep)
+
+
+@pytest.mark.parametrize(
+    "directive",
+    ["--gres=gpu:h100:2", "--gres=gpu:h100", "--gpus=h100:2", "-G h100:2", "--gres=shard:1,gpu:h100:1"],
+)
+def test_unverified_gpu_type_is_refused_in_every_spelling(fleetctl, directive):
+    """`gpu:<type>` with no count, `--gpus`'s `[type:]count`, `-G`, and a GRES
+    list all name a type; none may skip the verified-type check."""
+    text = f"#!/bin/bash\n#SBATCH -p a100\n#SBATCH {directive}\necho hi\n"
+    rep, _ = run_site_policy(fleetctl, _a100_h200_protocol(fleetctl), text)
+    assert "KIAC051" in [d.rule_id for d in rep.items if d.level == "ERROR"], directive
+
+
+@pytest.mark.parametrize("directive", ["--gres=gpu:a100", "--gpus=a100:2", "-G a100:1"])
+def test_verified_gpu_type_passes_in_every_spelling(fleetctl, directive):
+    text = f"#!/bin/bash\n#SBATCH -p a100\n#SBATCH {directive}\necho hi\n"
+    rep, _ = run_site_policy(fleetctl, _a100_h200_protocol(fleetctl), text)
+    assert "KIAC051" not in [d.rule_id for d in rep.items if d.level == "ERROR"], directive

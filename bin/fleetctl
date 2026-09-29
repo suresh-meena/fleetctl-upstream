@@ -1804,7 +1804,8 @@ class Report:
 
 def _render_diagnostic_lines(diag: Diagnostic) -> list[str]:
     simple = (
-        diag.excerpt is None
+        diag.line is None
+        and diag.excerpt is None
         and diag.suggestion is None
         and diag.confidence is None
         and "\n" not in diag.message
@@ -1882,7 +1883,7 @@ def render_preflight_json(rep: Report, path: str, *, strict: bool = False) -> st
 SHORT_TO_LONG = {
     "A": "--account",
     "a": "--array",
-    "B": "--extra-node-list",
+    "B": "--extra-node-info",
     "b": "--begin",
     "c": "--cpus-per-task",
     "C": "--constraint",
@@ -1890,7 +1891,7 @@ SHORT_TO_LONG = {
     "D": "--chdir",
     "e": "--error",
     "F": "--nodefile",
-    "G": "--gres",
+    "G": "--gpus",
     "H": "--hold",
     "i": "--input",
     "J": "--job-name",
@@ -2206,7 +2207,7 @@ KNOWN_LONG = frozenset(
     --cluster-constraint --clusters --comment --constraint --contiguous
     --core-spec --cores-per-socket --cpu-freq --cpus-per-gpu --cpus-per-task
     --chdir --deadline --delay-boot --dependency --distribution --error
-    --exclude --exclusive --export --extra-node-list --get-user-env --gid
+    --exclude --exclusive --export --extra-node-info --get-user-env --gid
     --gpu-bind --gpu-freq --gpus --gpus-per-node --gpus-per-socket --gpus-per-task
     --gres --gres-flags --hint --hold --ignore-pbs --input --job-name
     --kill-on-invalid-dep --licenses --mail-type --mail-user --mcs-label --mem
@@ -2595,7 +2596,7 @@ def _valid_dep_token(token: str) -> bool:
 def _check_gpus(script: ParsedScript, rep: Report) -> None:
     for directive in script.get_all("--gres"):
         value = directive.value or ""
-        if not _valid_gres(value):
+        if not all(_valid_gres(spec) for spec in value.split(",")):
             rep.error(
                 "SLURM070",
                 f"invalid --gres spec '{value}'",
@@ -2604,7 +2605,11 @@ def _check_gpus(script: ParsedScript, rep: Report) -> None:
                 suggestion="--gres=name[:type]:count — e.g. gpu, gpu:2, gpu:a100:1 "
                 "(actual type strings come from the cluster)",
             )
-    gres_gpu = any((d.value or "").split(":")[0] == "gpu" for d in script.get_all("--gres"))
+    gres_gpu = any(
+        spec.split(":")[0] == "gpu"
+        for d in script.get_all("--gres")
+        for spec in (d.value or "").split(",")
+    )
     flags = [option for option in _GPU_COUNT_OPTS if script.has(option)]
     if gres_gpu and flags:
         rep.warn(
@@ -2820,16 +2825,20 @@ def check_modules(script: ParsedScript, rep: Report, runner: Any = None) -> None
 def iter_gpu_requests(script: ParsedScript) -> Iterable[tuple[int, str, str | None, int | None]]:
     """Yield (line_no, raw, gpu_type_or_None, count_or_None) per GPU request."""
     for directive in script.get_all("--gres"):
-        parts = (directive.value or "").split(":")
-        if not parts or parts[0] != "gpu":
-            continue
-        if len(parts) == 3:
-            gtype, count = parts[1], int(parts[2]) if parts[2].isdigit() else None
-        elif len(parts) == 2 and parts[1].isdigit():
-            gtype, count = None, int(parts[1])
-        else:
-            gtype, count = None, None
-        yield directive.line_no, directive.raw, gtype, count
+        for spec in (directive.value or "").split(","):
+            parts = spec.split(":")
+            if parts[0] != "gpu":
+                continue
+            if len(parts) == 3:
+                gtype, count = parts[1], int(parts[2]) if parts[2].isdigit() else None
+            elif len(parts) == 2 and parts[1].isdigit():
+                gtype, count = None, int(parts[1])
+            elif len(parts) <= 2:
+                # Slurm's count defaults to 1: `gpu` and `gpu:a100` ask for one.
+                gtype, count = (parts[1] if len(parts) == 2 else None), 1
+            else:
+                gtype, count = None, None
+            yield directive.line_no, directive.raw, gtype, count
     for option in _GPU_COUNT_OPTS:
         for directive in script.get_all(option):
             value = directive.value or ""
@@ -2837,7 +2846,9 @@ def iter_gpu_requests(script: ParsedScript) -> Iterable[tuple[int, str, str | No
             if len(parts) == 3 and parts[0] == "gpu":
                 gtype, count = parts[1], int(parts[2]) if parts[2].isdigit() else None
             elif len(parts) == 2 and parts[1].isdigit():
-                gtype, count = None, int(parts[1])
+                # `[type:]count`, as in --gpus=a100:2; a bare `gpu:` is no type.
+                gtype = None if parts[0] == "gpu" else parts[0]
+                count = int(parts[1])
             elif value.isdigit():
                 gtype, count = None, int(value)
             else:
@@ -3973,7 +3984,12 @@ def fanout_execute(
             return work(key)
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = {key: pool.submit(guarded, hop, key) for hop, key in items}
+        # Worker threads do not inherit contextvars, and the --timeout
+        # deadline is one; each task runs in its own copy of this context.
+        futures = {
+            key: pool.submit(contextvars.copy_context().run, guarded, hop, key)
+            for hop, key in items
+        }
     return [(key, futures[key].result()) for key in ordered]
 
 
@@ -5799,6 +5815,36 @@ _SECRET_COMMAND_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _SECRET_COMMAND_LOCK = threading.Lock()
 
 
+def run_upcall(
+    argv: list[str],
+    *,
+    timeout: float,
+    input: str | None = None,
+    env: dict[str, str] | None = None,
+) -> "subprocess.CompletedProcess[str]":
+    """`subprocess.run` for a secret upcall, except a timeout kills its group.
+
+    Plain `subprocess.run` kills only the direct child on timeout, so anything
+    the upcall spawned would outlive it.  This follows run_command's pattern:
+    its own session, and the whole group killed when the timeout hits.
+    """
+    with subprocess.Popen(
+        argv,
+        text=True,
+        env=env,
+        start_new_session=True,
+        stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def run_secret_command(command: str, *, what: str) -> dict[str, Any]:
     """Run one secret upcall and parse its output, cached for the TTL.
 
@@ -5823,13 +5869,7 @@ def run_secret_command(command: str, *, what: str) -> dict[str, Any]:
         if cached is not None and cached[0] > time.monotonic():
             return dict(cached[1])
     try:
-        completed = subprocess.run(
-            argv,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=SECRET_COMMAND_TIMEOUT,
-        )
+        completed = run_upcall(argv, timeout=SECRET_COMMAND_TIMEOUT)
     except FileNotFoundError as exc:
         raise FleetError(
             f"secret command for {what} cannot be run: {argv[0]!r} not found"
@@ -5857,13 +5897,7 @@ def run_secret_command(command: str, *, what: str) -> dict[str, Any]:
 def run_pass_show(secret_ref: str) -> str:
     """Fetch one pass entry."""
     try:
-        completed = subprocess.run(
-            ["pass", "show", secret_ref],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=PASS_COMMAND_TIMEOUT,
-        )
+        completed = run_upcall(["pass", "show", secret_ref], timeout=PASS_COMMAND_TIMEOUT)
     except FileNotFoundError as exc:
         raise FleetError("`pass` is required for pass-backed secrets") from exc
     except subprocess.TimeoutExpired as exc:
@@ -5919,14 +5953,8 @@ def run_pass_insert(secret_ref: str, content: str, *, force: bool) -> None:
         f"{existing_gpg_opts} {extra_gpg_opts}".strip()
     )
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            input=content,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=PASS_COMMAND_TIMEOUT,
+        completed = run_upcall(
+            command, input=content, env=env, timeout=PASS_COMMAND_TIMEOUT
         )
     except FileNotFoundError as exc:
         raise FleetError("`pass` is required for pass-backed fleet config") from exc
@@ -10874,8 +10902,10 @@ def _json_sync_transfer(
                 force=bool(args.force),
                 excludes=excludes,
             )
-        except FleetError:
-            if args.no_fallback:
+        except FleetError as error:
+            # As in command_sync_transfer: a peer rsync that may have changed
+            # the destination stops rather than repeating through the relay.
+            if isinstance(error, PeerTransferUncertain) or args.no_fallback:
                 raise
             used_relay = True
             code = run_relay_transfer(

@@ -133,3 +133,34 @@ def test_pre_dispatch_peer_error_still_uses_relay(fleetctl, monkeypatch, capsys)
     assert fleetctl.command_sync_transfer(args, object(), level=0) == 0
     assert relayed == [True]
     assert "probe failed" in capsys.readouterr().err
+
+
+def test_json_uncertain_peer_failure_stops_without_relay(fleetctl, monkeypatch):
+    """`--json` follows the text path's rule instead of relaying over a partial copy."""
+    source = SimpleNamespace(target=SimpleNamespace(name="source"), binding=None)
+    dest = SimpleNamespace(target=SimpleNamespace(name="dest"), binding=None)
+    monkeypatch.setattr(fleetctl, "transfer_endpoint_plan", lambda *_args: source)
+    monkeypatch.setattr(fleetctl, "build_plan", lambda *_args: dest)
+    monkeypatch.setattr(fleetctl, "resolve_transfer_path", lambda *_args, **_kw: "/path")
+    monkeypatch.setattr(fleetctl, "central_sync_budget_bytes", lambda *_args: 1)
+    monkeypatch.setattr(fleetctl, "enforce_control_budget", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        fleetctl,
+        "run_peer_transfer",
+        lambda *_args, **_kw: (_ for _ in ()).throw(
+            fleetctl.PeerTransferUncertain("partial transfer", exit_code=23)
+        ),
+    )
+
+    def relay_must_not_run(*_args, **_kwargs):
+        pytest.fail("relay would repeat a potentially partial peer transfer")
+
+    monkeypatch.setattr(fleetctl, "run_relay_transfer", relay_must_not_run)
+    args = SimpleNamespace(
+        expected_role=None, selector=None, local_path="source", remote_path="dest",
+        delete=False, force=False, dry_run=False, relay=False, no_fallback=False,
+    )
+    with pytest.raises(fleetctl.PeerTransferUncertain, match="partial transfer"):
+        fleetctl._json_sync_transfer(
+            args, object(), level=0, start=0.0, attempt=fleetctl.Attempt()
+        )

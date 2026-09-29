@@ -6,6 +6,8 @@ verbatim -- this code was carried into the fleetctl section nearly
 unchanged, so the assertions are the same, only the import source differs.
 """
 
+import pytest
+
 import fleetctl
 
 
@@ -153,10 +155,26 @@ def test_short_to_long_mapping_is_complete_for_common_options():
     assert fleetctl.SHORT_TO_LONG["A"] == "--account"
     assert fleetctl.SHORT_TO_LONG["t"] == "--time"
     assert fleetctl.SHORT_TO_LONG["q"] == "--qos"
-    assert fleetctl.SHORT_TO_LONG["G"] == "--gres"
+    assert fleetctl.SHORT_TO_LONG["G"] == "--gpus"  # sbatch: -G, --gpus
     assert fleetctl.SHORT_TO_LONG["J"] == "--job-name"
 
 
 def test_directive_line_stops_at_trailing_comment():
     script = fleetctl.parse_text("#!/bin/bash\n#SBATCH --mem=4G # a trailing note\n")
     assert script.get("--mem") == "4G"
+
+
+@pytest.mark.parametrize("directive", ["-G 2", "--gpus=a100:2", "--gres=gpu:2,shard:1", "-B 2:8", "--extra-node-info=2:8"])
+def test_valid_gpu_and_node_info_directives_are_not_refused(fleetctl, directive):
+    script = fleetctl.parse_text(f"#!/bin/bash\n#SBATCH {directive}\necho hi\n")
+    rep = fleetctl.Report()
+    fleetctl.check_generic(script, rep)
+    assert not [d for d in rep.items if d.level == "ERROR"], directive
+    assert "SLURM001" not in rep.rule_ids(), directive
+
+
+def test_an_invalid_spec_inside_a_gres_list_is_still_refused(fleetctl):
+    script = fleetctl.parse_text("#!/bin/bash\n#SBATCH --gres=gpu:2,gpu:0\necho hi\n")
+    rep = fleetctl.Report()
+    fleetctl.check_generic(script, rep)
+    assert "SLURM070" in rep.rule_ids()

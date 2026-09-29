@@ -6,6 +6,7 @@ These run real local processes only (sh, sleep, setsid) -- nothing dials out.
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 import pytest
@@ -79,3 +80,26 @@ def test_capture_limits_truncate_without_blocking_the_child(fleetctl):
     assert len(completed.stdout) == 1000
     assert completed.stdout_truncated is True
     assert completed.stderr_truncated is False
+
+
+def test_fanout_workers_see_the_deadline(fleetctl):
+    """ThreadPoolExecutor workers do not inherit contextvars on their own."""
+    with fleetctl.deadline_scope(5.0):
+        results = fleetctl.fanout_execute(
+            [("hop", "a"), ("hop", "b")],
+            jobs=2,
+            work=lambda key: (0, repr(fleetctl._deadline_remaining() is not None), ""),
+        )
+    assert [out for _key, (_code, out, _err) in results] == ["True", "True"]
+
+
+def test_secret_upcall_timeout_kills_what_it_spawned(fleetctl, tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    script = f"sleep 30 & echo $! > {pidfile}; wait"
+    with pytest.raises(subprocess.TimeoutExpired):
+        fleetctl.run_upcall(["sh", "-c", script], timeout=0.5)
+    grandchild = int(pidfile.read_text())
+    deadline = time.monotonic() + 2
+    while _alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(grandchild), "a helper the upcall spawned outlived its timeout"

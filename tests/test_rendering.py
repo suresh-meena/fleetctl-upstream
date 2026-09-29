@@ -147,3 +147,9 @@ def test_inferred_confidence_on_unresolvable_command(fleetctl):
     diag = [d for d in rep.items if d.rule_id == "FS002"][0]
     assert diag.level == "INFO"
     assert diag.confidence == fleetctl.CONF_INFERRED
+
+
+def test_text_renderer_keeps_the_line_of_a_one_line_diagnostic(fleetctl):
+    rep = fleetctl.Report()
+    diag = rep.error("SLURM003", "cannot tokenize #SBATCH line: No closing quotation", line=7)
+    assert "line 7" in "\n".join(fleetctl._render_diagnostic_lines(diag))

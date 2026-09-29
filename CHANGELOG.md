@@ -121,6 +121,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `setup.sh` queue bootstrap when the USB printer is connected.
 - OpenClaw home service autostart for mileva.
 ### Fixed
+- `exec --all`/`--tag` now honour `--timeout`: fan-out worker threads did not
+  inherit the deadline, so one unresponsive host could hang the whole run.
+- The submit gate reads GPU requests as Slurm does. `-G` is `--gpus`,
+  `--gres=gpu:<type>` and `--gpus=<type>:<n>` keep their type for the site's
+  GPU-type check, and a comma-separated `--gres` list is accepted; before,
+  an unverified type spelled these ways passed. `-B` is `--extra-node-info`.
+- `sync transfer --json` also stops after an uncertain peer failure instead
+  of relaying over a possibly partial destination.
+- Secret-command and `pass` timeouts kill the helper's whole process group,
+  not only its direct child.
+- Text preflight reports keep the line number of one-line diagnostics.
 - Destructive sync checks now resolve destination symlinks through the active
   route, including symlinked home configuration directories. Pull deletes also
   reject local home and protected destinations even with `--force`.
