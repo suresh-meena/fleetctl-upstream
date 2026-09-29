@@ -730,6 +730,8 @@ define_links() {
 		# Setup Codex managed files + skills from dotfiles repo
 		setup_codex_config
 		setup_codex_skills
+		# Link the shared skill library into Claude Code as well
+		setup_claude_skills
 	fi
 	# Guix configuration (always included unless machine not found)
 	if [[ -d "$DOTFILES_DIR/guix" ]]; then
@@ -894,6 +896,46 @@ setup_codex_skills() {
 		log INFO "Queued $queued Codex skill symlink(s) for installation"
 	else
 		debug "No new Codex skill symlinks needed"
+	fi
+}
+# -----------------------------------------------------------------------------
+# Claude skills setup (shares the same skill library as Codex)
+# -----------------------------------------------------------------------------
+setup_claude_skills() {
+	local source_skills_dir="$DOTFILES_DIR/codex/skills"
+	local target_skills_dir="$HOME/.claude/skills"
+	local queued=0
+	local skill_dir
+	if [[ ! -d "$source_skills_dir" ]]; then
+		debug "No shared skills directory found at: $source_skills_dir"
+		return 0
+	fi
+	for skill_dir in "$source_skills_dir"/*; do
+		[[ -d "$skill_dir" ]] || continue
+		[[ -f "$skill_dir/SKILL.md" ]] || {
+			debug "Skipping non-skill directory: $(basename "$skill_dir")"
+			continue
+		}
+		local skill_name
+		local target_link
+		skill_name="$(basename "$skill_dir")"
+		target_link="$target_skills_dir/$skill_name"
+		if [[ -L "$target_link" ]] && [[ "$(readlink -f "$target_link")" == "$(readlink -f "$skill_dir")" ]]; then
+			debug "Claude skill already linked: $skill_name"
+			continue
+		fi
+		# Only auto-install missing skill links. Keep any existing target untouched.
+		if [[ -e "$target_link" || -L "$target_link" ]]; then
+			log WARNING "Claude skill target exists, skipping: $target_link"
+			continue
+		fi
+		LINKS["$skill_dir"]="$target_link"
+		queued=$((queued + 1))
+	done
+	if [[ $queued -gt 0 ]]; then
+		log INFO "Queued $queued Claude skill symlink(s) for installation"
+	else
+		debug "No new Claude skill symlinks needed"
 	fi
 }
 # -----------------------------------------------------------------------------

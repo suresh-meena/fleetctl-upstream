@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `doctor` now warns when a queue claiming `verified-by-run`/`verified-live`
   has no `as_of`, an unreadable one, or one older than 180 days -- so
   "verified" cannot quietly decay into "was true once".
+- Claude Code now links the shared `codex/skills` library into
+  `~/.claude/skills` via `setup_claude_skills`, installing the
+  `remote-fleet-operator` (fleetctl) skill alongside Codex and ZCode
 - `fleetctl sync transfer <src>[:<path>] <dst>[:<path>]`: target-to-target
   rsync that runs on the source and reaches the destination over one
   agent-forwarded ssh hop, falling back to the local pull-then-push relay when
