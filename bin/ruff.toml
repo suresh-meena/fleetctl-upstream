@@ -1,0 +1,13 @@
+# Lint policy for fleetctl, shared by ../tests. fleetctl has no .py suffix, so
+# it is included by name.
+target-version = "py311"
+extend-include = ["fleetctl"]
+
+[lint]
+# Bugs and dead code, not style: unused imports and variables, redefinitions,
+# bugbear, blind excepts (deliberate ones carry `noqa: BLE001`), pylint
+# errors, and stale noqa comments.
+select = ["E4", "E7", "E9", "F", "B", "BLE001", "PLE", "RUF100"]
+ignore = [
+  "B904",  # exception chaining is style here
+]

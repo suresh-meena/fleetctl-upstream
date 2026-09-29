@@ -24,7 +24,6 @@ import http.server
 import json
 import multiprocessing
 import shutil
-import socket as socket_module
 import subprocess
 import sys
 import tempfile
@@ -288,10 +287,10 @@ class _ScriptedHandler(http.server.BaseHTTPRequestHandler):
     responses: dict = {}
     delay: float = 0.0
 
-    def log_message(self, *a) -> None:  # noqa: D401 - silence test-server logging
+    def log_message(self, *a) -> None:  # silence test-server logging
         pass
 
-    def do_POST(self) -> None:  # noqa: N802 - http.server's own naming
+    def do_POST(self) -> None:
         if self.delay:
             time.sleep(self.delay)
         length = int(self.headers.get("Content-Length", 0))

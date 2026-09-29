@@ -38,7 +38,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-VERSION = "0.1.0"
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 STATE_DIR_MODE = 0o700
@@ -496,7 +495,6 @@ class PoolRecord:
     name: str
     targets: tuple[str, ...] = ()
     match_tags: tuple[str, ...] = ()
-    strategy: str = "ordered"
 
 
 @dataclass(frozen=True)
@@ -1225,7 +1223,6 @@ CAPABILITY_COMMON_KEYS = ("arch", "gpu_model", *FIT_ORDER)
 
 # Two-character operators first, so `>=` is never read as `>` with a stray `=`.
 REQUIREMENT_OPERATORS = (">=", "<=", "!=", "==", ">", "<", "=")
-REQUIREMENT_ORDERINGS = (">=", "<=", ">", "<")
 
 
 @dataclass(frozen=True)
@@ -1944,9 +1941,6 @@ class Directive:
     option: str  # normalized long form ("--mem") or raw token if unrecognized
     value: str | None
     raw: str  # full original line, stripped
-
-    def value_str(self) -> str:
-        return self.value if self.value is not None else ""
 
 
 @dataclass
@@ -4965,10 +4959,10 @@ def target_schema_warnings(path: Path) -> list[str]:
     warnings: list[str] = []
     for entry in sorted(path.glob("*.toml")):
         raw = load_toml_file(entry, default={})
-        for field, guidance in TARGET_FILE_WARNINGS.items():
-            if field in raw:
+        for key, guidance in TARGET_FILE_WARNINGS.items():
+            if key in raw:
                 warnings.append(
-                    f"target file {entry} defines `{field}`; {guidance}"
+                    f"target file {entry} defines `{key}`; {guidance}"
                 )
     return warnings
 
@@ -6853,7 +6847,7 @@ def record_submitted_job(paths: FleetPaths, record: dict[str, Any]) -> None:
     """
     try:
         append_jsonl(jobs_ledger_file(paths), record)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- the job is queued; bookkeeping must not fail submit
         print(
             f"warning: job {record.get('job_id') or '?'} was submitted but could not "
             f"be recorded in {jobs_ledger_file(paths)} ({exc}); `fleetctl job status` "
@@ -7009,7 +7003,7 @@ def record_invocation(
                 "caller": bounded_caller_env(),
             },
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 -- auditing runs in main()'s finally and must never raise
         pass
 
 
@@ -11797,7 +11791,7 @@ def _json_submit_dispatch(
                         },
                     )
                     details["ledger_recorded"] = True
-                except Exception:
+                except Exception:  # noqa: BLE001 -- the job is queued; a ledger failure must not fail submit
                     details["ledger_recorded"] = False
     return {
         "completed": completed,
@@ -11892,7 +11886,6 @@ def _json_submit(args: argparse.Namespace, context: FleetContext) -> int:
         if not args.dry_run:
             attempt.connecting = True
         ssh_runtime = plan.ssh_runtime() if args.dry_run else plan.connect()
-        cwd = plan.cwd
 
         if args.native_batch:
             if args.script_args:
@@ -12890,10 +12883,9 @@ def command_doctor(args: argparse.Namespace) -> int:
             # A target naming a profile that does not exist used to pass doctor
             # and fail at the moment you tried to use it.
             try:
-                profile = context.resolve_profile(target, None, None)
+                context.resolve_profile(target, None, None)
             except FleetError as exc:
                 problems.append(f"target {target.name!r}: {exc}")
-                profile = None
             if target.role is None:
                 # An inferred role is the conservative reading of the protocol, not
                 # a fact about the machine.  Say so once per target, by name.
@@ -13758,7 +13750,7 @@ def render_admission_table() -> str:
     rows = [
         "    "
         + "role".ljust(role_column)
-        + "".join(verb.ljust(width) for verb, width in zip(VERBS, widths))
+        + "".join(verb.ljust(width) for verb, width in zip(VERBS, widths, strict=True))
     ]
     for role in ROLES:
         rows.append(
@@ -13766,7 +13758,7 @@ def render_admission_table() -> str:
             + role.ljust(role_column)
             + "".join(
                 glyphs[decision].ljust(width)
-                for decision, width in zip(ROLE_MATRIX[role], widths)
+                for decision, width in zip(ROLE_MATRIX[role], widths, strict=True)
             )
         )
     rows.append("")

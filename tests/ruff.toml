@@ -1,0 +1,2 @@
+# fleetctl's tests follow the same lint policy as the tool itself.
+extend = "../bin/ruff.toml"

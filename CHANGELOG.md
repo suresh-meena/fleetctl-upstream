@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Changed
+- Lint `fleetctl` and its tests with a bug-focused ruff config (`bin/ruff.toml`;
+  `ruff check bin/fleetctl tests`), and remove unused internals.
 - Forward JSON stdout and stderr capture limits through SSH, restoring
   `exec --json` and the other bounded remote result paths.
 - `sync --delete` now passes checked canonical destinations to rsync for remote

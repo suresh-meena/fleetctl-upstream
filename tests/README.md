@@ -6,6 +6,13 @@ Run from the `fleet-dotfiles` checkout root:
 cd shared/fleet-dotfiles && python3 -m pytest tests -q
 ```
 
+Lint `fleetctl` and its tests for unused code and likely bugs with the rules
+in `bin/ruff.toml`:
+
+```
+ruff check bin/fleetctl tests
+```
+
 `bin/fleetctl` is a single-file, stdlib-only CLI with **no `.py` extension**,
 so it cannot be `import`ed the normal way. `tests/conftest.py` loads it by
 hand with `importlib.machinery.SourceFileLoader` and registers the result as

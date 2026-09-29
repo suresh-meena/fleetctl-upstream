@@ -140,7 +140,7 @@ def test_scancel_sigterm_still_removes_the_payload_and_exits_143(fleetctl, tmp_p
 def test_script_args_are_individually_quoted_and_the_payload_var_still_expands(fleetctl):
     text = render_with_payload(fleetctl, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n", script_args=["a b", "c"])
     lines = text.splitlines()
-    run_line = lines[[i for i, l in enumerate(lines) if l == extract_delimiter(text)][-1] + 1]
+    run_line = lines[[i for i, line in enumerate(lines) if line == extract_delimiter(text)][-1] + 1]
     assert '"$__fleetctl_payload"' in run_line
     assert "'a b'" in run_line
     result = subprocess.run(["bash", "-c", "\n".join(lines[lines.index("umask 077"):])], text=True, capture_output=True, timeout=10)
