@@ -177,7 +177,87 @@ Rules that follow:
      site expects a fully native scheduler script and `fleetctl` should not wrap
      the payload
 7. Inspect jobs with `fleetctl job status`, `fleetctl job logs`, and
-   `fleetctl job cancel`.
+   `fleetctl job cancel` -- within the polling limits in the next section.
+
+## Running work: submit to the fleet queue, then wait
+
+When the fleet queue is deployed (`fq whoami` answers with your own
+`FQ_TOKEN_FILE`) and the destination is enabled with reviewed target evidence,
+compute goes through `fq`. fleetqd owns the budgeted observer for each managed
+Slurm site; an agent blocks on `fq wait` rather than polling `squeue`.
+
+```bash
+fq --json submit --idempotency-key "<task>-<config-hash>" --gpus 1 --on <target> \
+   --wait --timeout 9m -- python train.py
+fq --json wait <job-id> --timeout 9m      # exit 4 means: still running, call again
+fq --json logs <job-id> [--err] [--tail BYTES]
+fq --json fetch <job-id> -o <dir>          # outputs requested with --collect
+```
+
+- Always pass an idempotency key derived from the task, never a random one. On
+  exit 5 (fleetqd unreachable) retry with the *same* key: it replays the
+  original job instead of creating a second.
+- Read the JSON only: `job.terminal`, `job.success`, `job.execution.outcome`,
+  `job.execution.exit.code`, `job.artifacts.state`. Compute success and output
+  collection are reported separately.
+- Exit codes: 0 done and succeeded, 1 ended unsuccessfully, 2 refused, 3 not
+  found, 4 wait timed out (the job keeps running), 5 fleetqd unreachable, 6
+  auth, 7 server or version error, 8 rate limited, 130 interrupted (the job
+  keeps running). A refusal (2) is the answer; do not resubmit it elsewhere.
+- Clusters are used only when the token allows them and the job names one
+  (`--on <site>`, `--queue <site>:<queue>`) or passes `--allow-clusters`.
+- `fq logs` and ordinary `fq fetch` read numpi's cache. Repeated reads do not
+  accelerate a remote poll; a cluster job's log arrives on the approved site
+  cadence. A missing artifact may require a separate budgeted transfer.
+- Shape the queue instead of resubmitting:
+  - `fq modify <id> --gpus/--mem/--time/--on/--priority/--begin ...` changes a
+    job that has not started; it is re-validated, and what the job *is*
+    (command, code, dependencies, outputs) cannot change.
+  - `fq top <id>` moves it ahead of your other waiting jobs; `fq hold`/`release`.
+  - `fq requeue <id>` reruns a finished job as a new one.
+  - `fq cancel|hold|release --name 'sweep-*' | --group grp_... | --phase PENDING`
+    act on many at once.
+- Order work with dependencies, not polling: `--after afterok:<id>`, or
+  `--after afterok:<grp_...>` for every member of an `--array`/`--each` group.
+  `--array 0-99%4` runs at most 4 at once; each task reads `FQ_ARRAY_TASK_ID`.
+  `--begin +2h` or `--begin 2026-09-24T09:00` defers the start.
+- A long-waiting multi-GPU job may receive an aging placement hold;
+  `fq explain <id>` reports why it remains waiting.
+- `fq q` is squeue (`-t PD,R`, `-n 'sweep-*'`, `-w <machine>`, `-o` columns,
+  `--watch`; waiting jobs show their place in line) and `fq history
+  [--summary]` is sacct (wait, run time, GPU-hours). Both read numpi only, so
+  use them instead of any `squeue`/`sacct` on a login node.
+- Long training: `--resume N` warns the job with SIGUSR1 five minutes before its
+  walltime (`--warn-signal`/`--warn-before` to change), resubmits it after
+  timeout, preemption or node failure, and gives every attempt
+  `$FQ_CHECKPOINT_DIR` (with `FQ_RESUMED=1` when it holds something). Save
+  there on the signal and load from it on start; the retry goes back to the
+  machine that holds it.
+- `--spill-after 2h --spill-to kiac:a100` tries owned machines first and a
+  cluster only if the job has not started by then.
+- Interactive work on a workstation: `fq alloc --gpus 1 [--shell]` holds verified-
+  idle GPUs; `fq shell <id> [-- CMD]` enters it with those GPUs pinned, and the
+  shell ends with the allocation. There are no interactive sessions on clusters.
+
+Without `fq` (not deployed, or no token), use `fleetctl submit` only where the
+site permits that workflow. Poll at the site's approved cadence and within the
+configured control budget. Never loop `squeue`, `sacct` or `fleetctl job status`
+to chase a faster response.
+
+- On a site with a `[control_budget]`, every control call spends a token.
+  Exit 75 means the bucket is empty: wait the `retry_after` it reports (under
+  `--json`, in `details.retry_after`) or pass `--budget-wait <seconds>`; never
+  retry in a loop. Say what a read-only scheduler query is with `fleetctl exec
+  --admin --op-class monitor -- squeue ...`.
+- `--json` on `exec`, `script`, `sync`, `submit` and `job status|cancel` prints
+  one `fleetctl.result/v1` document. Branch on `outcome` and
+  `may_have_executed`, not on exit codes. When a `submit` says
+  `may_have_executed: true`, preserve the request and reconcile the exact
+  receipt, scheduler identity and site evidence within budget. A job name is
+  only a lookup label; never infer that an empty name search proves nonexecution
+  or submit the same attempt again.
+- `--timeout <seconds>` bounds the whole command, staging included; it exits
+  124. A timeout after the command was sent is `may_have_executed: true`.
 
 ## Configuration tasks
 
@@ -218,9 +298,11 @@ When the user wants to bring hosts into the fleet:
   alternative; take that path, or ask. Do not reach for raw `ssh` to do the
   thing that was just refused, and do not add `--admin` to make a refusal go
   away -- it only lifts the cells the role marks as needing acknowledgement.
-- Container invocation belongs in a profile's `interpreter` or `submit_command`,
-  for example `["apptainer", "exec", ...]`. There is no second runtime dimension:
-  a protocol's `job_runtime` no longer exists, and a config still carrying it is
+- Container invocation for submitted work belongs in a profile's `interpreter`.
+  A Slurm profile's `submit_command` must call `sbatch` directly and pass
+  `{script}` exactly once as its final argument; a wrapper could run work on the
+  login node before Slurm receives it. There is no second runtime dimension: a
+  protocol's `job_runtime` no longer exists, and a config still carrying it is
   reported by `doctor` and stripped by `fleetctl migrate-config`.
 - Ask the whole fleet a read-only question with `--all` or `--tag <tag>`, and
   `--jobs <n>` to overlap them: `fleetctl smoke --all --jobs 4`. Only `smoke`,

@@ -7,9 +7,11 @@
 - Before using an unfamiliar target, inspect its rules with
   `fleetctl protocol show <target>` and, for scheduler-backed targets,
   `fleetctl queue list <target>`.
-- Container invocation belongs in the profile's `interpreter` or
-  `submit_command`, for example `["apptainer", "exec", ...]`. There is no
-  `job_runtime`: how work is invoked belongs to the profile that invokes it.
+- Container invocation for submitted work belongs in the profile's
+  `interpreter`. A Slurm profile's `submit_command` must invoke `sbatch`
+  directly, with `{script}` as its final argument; wrappers could run the job
+  on the login node before Slurm sees it. There is no `job_runtime`: how work
+  is invoked belongs to the profile that invokes it.
 - If `fleetctl protocol show <target>` reports `native_batch_required = true`,
   use `fleetctl submit --native-batch` and keep the site-native scheduler
   directives in the submitted script instead of relying on the wrapper path.

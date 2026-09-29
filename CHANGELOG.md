@@ -6,7 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+- Forward JSON stdout and stderr capture limits through SSH, restoring
+  `exec --json` and the other bounded remote result paths.
+- `sync --delete` now passes checked canonical destinations to rsync for remote
+  paths and local pulls, so a symlink at the originally requested path cannot
+  be repointed after the safety check to redirect deletion.
+- Require `remote_script_root` to resolve to a dedicated `/fleet/scripts` path
+  before staging or pruning, preventing cleanup from targeting shared or system data.
+- Require `--admin` for interactive SSH to Slurm login targets, and reject
+  relative `sbatch` executables in Slurm submit profiles and live preflight.
+- Require Slurm profiles to invoke `sbatch` directly and pass the staged script
+  as the final argument, preventing a misconfigured submit profile from running
+  a job directly on the login node.
+- Refuse `fleetctl script` on Slurm login targets even with `--admin`, preventing
+  staged direct execution from bypassing the scheduler; `exec --admin` remains
+  available for login control-plane commands.
+- `sync transfer` now stops with an uncertainty error after a dispatched peer
+  rsync fails, instead of retrying a potentially partial write through relay;
+  pre-transfer peer setup and probe failures can still fall back.
+
 ### Added
+- Optional `--expected-role workstation|login` on `fleetctl exec` and `sync push|pull`,
+  checked against the target's locally resolved inventory role before connecting.
+  `sync transfer` rejects the option because it has two target roles.
 - `fleetctl preflight <script> --target <target>`: an offline `#SBATCH`
   checker that reports what the scheduler would reject, with a stable rule ID
   per finding (`SH*` shell, `SLURM*` generic semantics, `FS*`, `MOD*`, and the
@@ -93,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `setup.sh` queue bootstrap when the USB printer is connected.
 - OpenClaw home service autostart for mileva.
 ### Fixed
+- Destructive sync checks now resolve destination symlinks through the active
+  route, including symlinked home configuration directories. Pull deletes also
+  reject local home and protected destinations even with `--force`.
 - `sync --delete` now refuses by what a path names, not how it is spelled. It
   refused `~` and `$HOME` but allowed `~/.`, `/home/<user>`, `/home/u/work/..`
   and `../..` from a project root -- each a whole home directory, which

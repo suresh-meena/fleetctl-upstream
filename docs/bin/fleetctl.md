@@ -52,7 +52,7 @@ and `--admin` is the toleration — permission, never a recommendation.
 ```
 role         ssh   exec  script sync  submit job
 bridge       yes   admin no     admin no     no
-login        yes   admin admin  yes   yes    yes
+login        admin admin no     yes   yes    yes
 compute      yes   yes   yes    yes   yes    yes
 workstation  yes   yes   yes    yes   yes    no
 storage      yes   admin no     yes   no     no
@@ -68,6 +68,12 @@ fine", so the state this tool exists to prevent cannot be spelled in the config
 at all. A refusal names the alternative — *run compute through `fleetctl
 submit`* — and no flag lifts it. `fleetctl explain <target>` reports every cell
 for one host, where a refusal is the answer rather than an error.
+
+On a `login` role, `script` is refused even with `--admin`: staging and running
+an arbitrary script there would bypass Slurm. Use `submit` to run scheduled
+work. `exec --admin` remains available for deliberate Slurm control-plane
+commands. Interactive SSH also requires `--admin`, because that shell can run
+unscheduled work.
 
 Role and protocol must agree, checked at load: `role = "login"` on a protocol
 that runs work directly is refused, and so is any other role on a
@@ -188,8 +194,10 @@ still carrying one.
 ```bash
 fleetctl smoke <target>                            # transport, then workdir
 fleetctl exec <target> -- python3 -c 'print(1)'    # after `--` is verbatim
+fleetctl exec <target> --expected-role workstation -- uptime
 fleetctl script ./setup.sh --target <target> -- --flag value
 fleetctl sync push .                               # from a bound directory
+fleetctl sync pull . --expected-role login
 fleetctl sync transfer gpu1:~/data gpu2:~/data     # peer-to-peer, relay fallback
 fleetctl submit train.sh --target <target> --queue <preset>
 fleetctl jobs                                      # what you have submitted
@@ -227,8 +235,16 @@ resolve — is printed as a `note:` rather than passed over.
 remote state — except for `sync`, where it runs `rsync --dry-run
 --itemize-changes` and returns rsync's own code.
 
-`sync --delete` refuses a home or root directory outright, and refuses the
-target's own workdir, or any pull, without `--force`.
+`sync --delete` resolves remote symlinks before checking the destination. It
+refuses the remote account's home and its ancestors, system directories, and
+protected home configuration directories. The target's host-level workdir
+requires `--force` when selected directly. The transfer then uses that checked
+canonical remote path, so changing an alias after the check does not change
+where rsync operates.
+For pulls, the local destination is checked after resolving symlinks; the local
+home and its ancestors, root, protected system directories, and protected home
+configuration directories are always refused, including with `--force`. A
+destructive pull uses the checked canonical local destination.
 
 `sync` compresses at level 1 rather than rsync's default 6, because a transfer
 multiplexed through a Raspberry Pi is bound by the compressor, not the link.
@@ -268,7 +284,12 @@ would be; you cannot replay a command from this file, and that is the point.
 
 Both are `0600` and keep their newest 2000 lines. Staged scripts under a
 profile's `remote_script_root` are collected after 14 days, by the same round
-trip that creates the next one.
+trip that creates the next one. Because collection recursively removes expired
+staging directories, the root must be a literal dedicated path ending in
+`/fleet/scripts`; the default `.local/state/fleet/scripts` resolves beneath the
+remote user's home. Roots such as a home/shared directory, `/tmp`, protected
+system locations, parent-directory traversal, and shell or home aliases are
+refused before staging or pruning.
 
 ## Secrets
 

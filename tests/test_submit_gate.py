@@ -166,6 +166,24 @@ def test_wrapper_paths_are_not_reported_as_the_operators(fleetctl_path, sandbox,
     assert "FS001" not in proc.stderr and "FS002" not in proc.stderr
 
 
+@pytest.mark.parametrize("json_flag", [False, True])
+def test_slurm_profile_cannot_run_script_directly_on_login(
+    fleetctl_path, sandbox, payload, json_flag
+):
+    """Reject a non-scheduler submit executable during local plan resolution."""
+    _tmp_path, config, sockets = sandbox
+    (config / "profiles.d" / "slurm-batch.toml").write_text(
+        'version = 1\nname = "slurm-batch"\n'
+        'job_id_pattern = "(?P<job_id>\\\\d+)"\n'
+        'submit_command = ["bash", "{script}"]\n'
+    )
+    args = ["--json"] if json_flag else []
+    proc = submit(fleetctl_path, sandbox, payload, *args)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "must invoke `sbatch` directly" in (proc.stdout + proc.stderr)
+    assert not any(sockets.iterdir()), "invalid profile opened a connection"
+
+
 # -- paths name the cluster, so they never refuse from here --------------------
 
 
@@ -219,3 +237,54 @@ def test_no_preflight_still_skips_the_gate(fleetctl_path, sandbox, tmp_path):
     proc = submit(fleetctl_path, sandbox, script, "--native-batch", "--no-preflight")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "KIAC023" not in proc.stderr
+
+
+# -- --account/--qos overrides are checked as the *effective* values (item 3) -
+
+
+def test_account_override_lets_h200_pass_its_own_required_qos(fleetctl_path, sandbox, payload):
+    """h200 presets no account (account_required=true) but does preset its own
+    qos ("h200_qos", matching required_qos); --account chiru alone should be
+    enough for a queue whose allowed_accounts includes 'chiru'."""
+    proc = submit(fleetctl_path, sandbox, payload, "--queue", "h200", "--account", "chiru")
+    # returncode 0 alone already proves no site-policy ERROR fired: submit's
+    # preflight gate raises whenever the report's worst level is ERROR.
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The wrapper (printed as the dry-run's rendered-script block, on stdout)
+    # carries the effective account, proving the override reached #SBATCH.
+    assert "#SBATCH --account=chiru" in proc.stdout
+
+
+def test_account_override_with_a_denied_account_is_refused(fleetctl_path, sandbox, payload):
+    """a100's denied_accounts includes 'chiru': the override is checked, not
+    just the preset."""
+    proc = submit(fleetctl_path, sandbox, payload, "--queue", "a100", "--account", "chiru")
+    assert proc.returncode == 2
+    assert "KIAC023" in proc.stderr
+
+
+def test_qos_override_replaces_the_queues_own_qos_in_the_wrapper(fleetctl_path, sandbox, payload):
+    proc = submit(
+        fleetctl_path, sandbox, payload,
+        "--queue", "h200", "--account", "chiru", "--qos", "other_qos",
+    )
+    # required_qos is "h200_qos"; overriding to "other_qos" must be caught.
+    assert proc.returncode == 2
+    assert "KIAC024" in proc.stderr
+    assert "other_qos" in proc.stderr
+
+
+def test_native_batch_refuses_account_and_qos_flags(fleetctl_path, sandbox, tmp_path):
+    script = tmp_path / "job.sbatch"
+    script.write_text(
+        "#!/bin/bash\n#SBATCH --partition=a100\n#SBATCH --account=research\n"
+        "#SBATCH --time=01:00:00\n\npython3 train.py\n"
+    )
+    proc = submit(fleetctl_path, sandbox, script, "--native-batch", "--account", "research")
+    assert proc.returncode == 2
+    assert "--account" in proc.stderr
+    assert "cannot be applied here" in proc.stderr
+
+    proc = submit(fleetctl_path, sandbox, script, "--native-batch", "--qos", "normal")
+    assert proc.returncode == 2
+    assert "--qos" in proc.stderr
