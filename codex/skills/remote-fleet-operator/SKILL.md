@@ -1,35 +1,65 @@
 ---
 name: remote-fleet-operator
-description: Operate remote machines, pools, and project-bound compute environments through fleetctl. Use when the task involves running experiments on named machines, syncing repos to remote hosts, writing or fixing Slurm batch scripts, staging scripts, submitting or inspecting jobs on schedulers, choosing partitions, GPUs, accounts, or QOS, interpreting pending or failed job states, inspecting fleet config, importing SSH aliases, fanning a read-only check across the fleet, or migrating an older private inventory to the schema fleetctl reads today. Prefer this over ad hoc raw SSH whenever the host should come from the user's managed fleet.
+description: Run and manage work on the user's own machines and clusters - the GPU workstations, the numpi bridge, and the Slurm sites KIAC and AMD MI210 - through fleetctl, the fq job queue (fleetqd) and fleetmon monitoring. Use whenever the user asks which GPUs are free, idle, busy or available, or whether all N GPUs are in use; to start, queue, spread, check, stop or cancel jobs, runs, sweeps or seeds on any machine; for job logs, queue length or why a job is waiting; to copy checkpoints or files between machines; to run a command on a named host; to write or fix Slurm batch scripts or choose partitions, GPUs, accounts or QOS; or to change fleet inventory, roles or protocols. Load it before any ssh, nvidia-smi, squeue, sacct, scancel or rsync aimed at those machines, and load it again after a context compaction.
 ---
 
 # Remote Fleet Operator
 
-Use `fleetctl` as the control plane for remote work.
+Three tools drive one fleet, and each answers a different question:
 
-## Goals
+- **`fq`** (client of `fleetqd`, the scheduler on numpi): run work and follow
+  it, and read cached GPU usage. [references/fq.md](references/fq.md)
+- **fleetmon** (read-only telemetry hub on numpi, port 8088): what every
+  host and GPU is doing. [references/fleetmon.md](references/fleetmon.md)
+- **`fleetctl`** (transport and admission policy): run a command, move
+  files, submit to Slurm, inspect inventory. `fleetctl help <topic>` is its
+  manual (overview, verbs, roles, reach, capabilities, config, secrets, jobs,
+  examples).
 
-- Keep host and login data out of version-controlled repos.
-- Reuse one global fleet inventory across projects.
-- Avoid brittle shell quoting and repo-local SSH wrappers.
-- Make remote actions boring: inspect, smoke test, sync, execute, submit.
-- Keep sensitive connection material out of target metadata.
-- Treat each target's `role` as the boundary on what may be done to it,
-  and `--admin` as an acknowledgement rather than a convenience.
-- Put each host's base `workdir` on the target itself.
-- Use project bindings only for defaults and for project-specific absolute
-  overrides when `workdir/<project-name>` is not correct.
-- Encode site rules in reusable private protocol files under
-  `~/.config/fleet/protocols.d/`, then bind targets to those protocols instead
-  of teaching host-specific quirks inline.
-- Prefer pass-backed fleet source data plus `fleetctl deploy-config` over
-  hand-editing the generated `~/.config/fleet/` tree.
+## Route the request first
+
+| The user asks | Start with | Never |
+| --- | --- | --- |
+| which GPUs are free or idle, are all N in use, what do I have | `fq usage --idle`, then `fq usage` | `fleetctl exec <host> -- nvidia-smi` host by host |
+| start, queue or spread runs or seeds, use all idle GPUs | `fq submit --gpus N --on a,b,c` with `--array` or `--each` | `nohup`/`setsid` worker loops via `fleetctl exec` |
+| is it done, show logs, why is it waiting | `fq wait`, `fq logs`, `fq explain`, `fq q` | `sleep; check` loops, `tail -f` over ssh |
+| stop or cancel jobs | `fq cancel <id>` or `fq cancel --name 'pat*'`; for Slurm jobs outside fq, `fleetctl job cancel` | `kill <slurm-jobid>`, or killing processes you did not start |
+| what is the queue or availability on KIAC or AMD | `fleetctl queue list <site>`, then **one** `fleetctl exec --admin --op-class monitor <site> -- sinfo ...` or `squeue ...` | repeated `squeue`, `sinfo` or `sacct` |
+| run a Slurm job | `fleetctl preflight`, then `fleetctl submit` (or `fq submit --on <site>` when enabled) | `sbatch` over raw ssh |
+| copy checkpoints or files between machines | `fleetctl sync transfer <src>:<path> <dst>:<path>` (`--admin` when an end is the bridge) | `scp`, or `rsync` over raw ssh |
+| run a command on a machine | `fleetctl exec <target> -- <argv>` | raw `ssh host 'bash -lc ...'` |
+| a machine named by IP, by "the one ending in 66", or loosely | `fleetctl list`, then `fleetctl show <target>` | guessing a target |
+| health of the fleet, the hub or the queue | `fleetctl doctor`, `fq --json whoami`, the fleetmon dashboard | restarting services to see what happens |
+
+`fq` reads (`usage`, `q`, `nodes`, `history`, `logs`, `explain`) come from
+numpi's caches and contact no machine, so repeat them freely. Everything that
+reaches a host goes through `fleetctl`.
+
+Before the first `fq` call, check that the client works here:
+`fq --json whoami`. Exit 0 means use `fq`. Otherwise follow the fallback table
+in [references/fq.md](references/fq.md); do not improvise job control.
+
+## Failures seen in real sessions
+
+These are what went wrong when this skill was not loaded. Do not repeat them.
+
+- Dozens of `nvidia-smi` calls across hosts to find a free GPU. One
+  `fq usage --idle` answers it, using fleetmon's freshness rules.
+- Hand-rolled GPU queues: a `worker.sh` per GPU launched with `setsid nohup`
+  over `fleetctl exec`. Nothing tracked, retried or cleaned them up, and they
+  could not be cancelled as jobs. Submit an `fq` array instead.
+- Polling `squeue` on a login node every few minutes. It spends the site's
+  control budget and admins can see it. Block on `fq wait`, or poll
+  `fleetctl job status` at the site's approved cadence.
+- Reporting a GPU as free from one sample, or from a stale one. Only
+  `idle` in `fq usage` is free; `?` is unknown.
 
 ## First checks
 
 Run these before changing anything substantial:
 
 ```bash
+fq --json whoami                 # is the queue usable from here?
 fleetctl doctor
 fleetctl list
 fleetctl project show
@@ -37,11 +67,9 @@ fleetctl explain <target-or-pool>
 ```
 
 If the current project is not bound, inspect the available targets or pools and
-either use an explicit target or bind the project.
-
-The manual is in the tool: `fleetctl help <topic>` for overview, verbs, roles,
-reach, config, secrets, jobs and examples, and `fleetctl doctor --probe` when
-the live fleet itself is in question. Read the topic instead of guessing.
+either use an explicit target or bind the project. Run `fleetctl doctor --probe`
+when the live fleet itself is in question. Read the manual topic instead of
+guessing.
 
 When a target may be scheduler-backed or otherwise policy-constrained, inspect:
 
@@ -115,6 +143,10 @@ route around.
 - Starting points for native Slurm batch scripts live under
   [references/templates/](references/templates/) — fill their placeholders
   from `fleetctl queue list`, never copy the example values blind.
+- Cluster availability is not in `fq usage`: fleetmon cannot see inside
+  Slurm compute nodes. Ask the scheduler once per question, through
+  `fleetctl exec --admin --op-class monitor`, and report what it said with
+  the time you asked.
 
 ## Evidence discipline
 
@@ -126,8 +158,8 @@ separate:
 
 | Class | Meaning | Example |
 | --- | --- | --- |
-| `verified-by-run` | a real job exercised it — cite job ID and state (`sacct` / `fleetctl job status`) | job 58822 COMPLETED with `chiru`+`h200_qos` on h200 |
-| `verified-live` | read from the scheduler or fleet this session | `fleetctl queue list` MaxTime, `scontrol show partition` |
+| `verified-by-run` | a real job exercised it — cite job ID and state (`sacct` / `fleetctl job status` / `fq show`) | job 58822 COMPLETED with `chiru`+`h200_qos` on h200 |
+| `verified-live` | read from the scheduler or fleet this session | `fleetctl queue list` MaxTime, `fq usage` sample age 4s |
 | `changed-untested` | a code/config change with no run evidence yet | pinning `pyarrow==25.0.1` |
 | `inferred` | reasoning only | "the array limit is probably MaxArraySize" |
 
@@ -146,24 +178,46 @@ Rules that follow:
   or protocol declarations, enforce it there instead of documenting it.
 - **Cite job IDs, not adjectives.** "Fixed the H200 wiring" carries no
   evidence; "job 58822, COMPLETED, account chiru, qos h200_qos" does.
+- **Answer availability questions with numbers and their age.** "rtx4090:
+  GPU 0 idle, GPU 1 busy (samples 6s old)" is an answer. "Looks mostly free"
+  is not.
 
-## Preferred workflow
+## Running work
 
-1. Resolve context.
-   Use `fleetctl project show`, `fleetctl resolve`, or `fleetctl show`.
-2. Inspect role and protocol.
-   Use `fleetctl explain <target>` for the admission answer, and
+When `fq` is usable and the destination is enabled in fleetqd, compute goes
+through `fq`. fleetqd owns placement, retries, logs and the budgeted observer
+for each managed Slurm site; an agent blocks on `fq wait` rather than polling.
+
+```bash
+fq usage --idle
+fq --json submit --idempotency-key "<task>-<config-hash>" --gpus 1 --on <a>,<b> \
+   --array 0-7%4 -- python train.py          # each task reads $FQ_ARRAY_TASK_ID
+fq --json wait <job-id> --timeout 9m         # exit 4: still running, call again
+fq logs <job-id> --tail 4000
+```
+
+- Derive the idempotency key from the task; on exit 5 retry with the *same*
+  key. A refusal (exit 2) is the answer: do not resubmit it elsewhere.
+- Read `job.terminal`, `job.success`, `job.execution.outcome` and
+  `job.execution.exit.code` from the JSON, not the exit code alone.
+- Everything else (dependencies, `--resume` checkpointing, spill to a
+  cluster, `fq alloc`/`fq shell`, `modify`/`top`/`requeue`, exit codes) is
+  in [references/fq.md](references/fq.md).
+
+Without `fq` (not deployed here, no token, or the destination not enabled),
+use `fleetctl` only where the site permits that workflow:
+
+1. Resolve context with `fleetctl project show`, `fleetctl resolve`, or
+   `fleetctl show`.
+2. Use `fleetctl explain <target>` for the admission answer, and
    `fleetctl protocol show` to decide whether the target is direct or
    scheduler-backed and whether `native_batch_required` forces site-native
    batch scripts. Use `fleetctl queue list` when queue choice matters.
-3. Verify transport.
-   Run `fleetctl smoke <target-or-pool>` unless the user explicitly wants a
+3. Run `fleetctl smoke <target-or-pool>` unless the user explicitly wants a
    direct attempt first.
-4. Sync code when needed.
-   Use `fleetctl sync push ...`.
-5. Check the batch script before the scheduler sees it.
-   On a scheduler-backed target, run `fleetctl preflight <script> --target
-   <target>`. `submit` runs it anyway, but running it first separates a
+4. Sync code when needed with `fleetctl sync push ...`.
+5. On a scheduler-backed target, run `fleetctl preflight <script> --target
+   <target>` first. `submit` runs it anyway, but running it first separates a
    script problem from a transport or policy one.
 6. Run the work through the narrowest interface that fits:
    - `fleetctl exec <target> -- ...` for direct-host argv execution
@@ -176,73 +230,12 @@ Rules that follow:
    - `fleetctl submit --native-batch <local-script> --target <target>` when a
      site expects a fully native scheduler script and `fleetctl` should not wrap
      the payload
-7. Inspect jobs with `fleetctl job status`, `fleetctl job logs`, and
-   `fleetctl job cancel` -- within the polling limits in the next section.
+7. Follow jobs with `fleetctl jobs`, `fleetctl job status`, `fleetctl job
+   logs`, and `fleetctl job cancel`, within the polling limits below.
 
-## Running work: submit to the fleet queue, then wait
-
-When the fleet queue is deployed (`fq whoami` answers with your own
-`FQ_TOKEN_FILE`) and the destination is enabled with reviewed target evidence,
-compute goes through `fq`. fleetqd owns the budgeted observer for each managed
-Slurm site; an agent blocks on `fq wait` rather than polling `squeue`.
-
-```bash
-fq --json submit --idempotency-key "<task>-<config-hash>" --gpus 1 --on <target> \
-   --wait --timeout 9m -- python train.py
-fq --json wait <job-id> --timeout 9m      # exit 4 means: still running, call again
-fq --json logs <job-id> [--err] [--tail BYTES]
-fq --json fetch <job-id> -o <dir>          # outputs requested with --collect
-```
-
-- Always pass an idempotency key derived from the task, never a random one. On
-  exit 5 (fleetqd unreachable) retry with the *same* key: it replays the
-  original job instead of creating a second.
-- Read the JSON only: `job.terminal`, `job.success`, `job.execution.outcome`,
-  `job.execution.exit.code`, `job.artifacts.state`. Compute success and output
-  collection are reported separately.
-- Exit codes: 0 done and succeeded, 1 ended unsuccessfully, 2 refused, 3 not
-  found, 4 wait timed out (the job keeps running), 5 fleetqd unreachable, 6
-  auth, 7 server or version error, 8 rate limited, 130 interrupted (the job
-  keeps running). A refusal (2) is the answer; do not resubmit it elsewhere.
-- Clusters are used only when the token allows them and the job names one
-  (`--on <site>`, `--queue <site>:<queue>`) or passes `--allow-clusters`.
-- `fq logs` and ordinary `fq fetch` read numpi's cache. Repeated reads do not
-  accelerate a remote poll; a cluster job's log arrives on the approved site
-  cadence. A missing artifact may require a separate budgeted transfer.
-- Shape the queue instead of resubmitting:
-  - `fq modify <id> --gpus/--mem/--time/--on/--priority/--begin ...` changes a
-    job that has not started; it is re-validated, and what the job *is*
-    (command, code, dependencies, outputs) cannot change.
-  - `fq top <id>` moves it ahead of your other waiting jobs; `fq hold`/`release`.
-  - `fq requeue <id>` reruns a finished job as a new one.
-  - `fq cancel|hold|release --name 'sweep-*' | --group grp_... | --phase PENDING`
-    act on many at once.
-- Order work with dependencies, not polling: `--after afterok:<id>`, or
-  `--after afterok:<grp_...>` for every member of an `--array`/`--each` group.
-  `--array 0-99%4` runs at most 4 at once; each task reads `FQ_ARRAY_TASK_ID`.
-  `--begin +2h` or `--begin 2026-09-24T09:00` defers the start.
-- A long-waiting multi-GPU job may receive an aging placement hold;
-  `fq explain <id>` reports why it remains waiting.
-- `fq q` is squeue (`-t PD,R`, `-n 'sweep-*'`, `-w <machine>`, `-o` columns,
-  `--watch`; waiting jobs show their place in line) and `fq history
-  [--summary]` is sacct (wait, run time, GPU-hours). Both read numpi only, so
-  use them instead of any `squeue`/`sacct` on a login node.
-- Long training: `--resume N` warns the job with SIGUSR1 five minutes before its
-  walltime (`--warn-signal`/`--warn-before` to change), resubmits it after
-  timeout, preemption or node failure, and gives every attempt
-  `$FQ_CHECKPOINT_DIR` (with `FQ_RESUMED=1` when it holds something). Save
-  there on the signal and load from it on start; the retry goes back to the
-  machine that holds it.
-- `--spill-after 2h --spill-to kiac:a100` tries owned machines first and a
-  cluster only if the job has not started by then.
-- Interactive work on a workstation: `fq alloc --gpus 1 [--shell]` holds verified-
-  idle GPUs; `fq shell <id> [-- CMD]` enters it with those GPUs pinned, and the
-  shell ends with the allocation. There are no interactive sessions on clusters.
-
-Without `fq` (not deployed, or no token), use `fleetctl submit` only where the
-site permits that workflow. Poll at the site's approved cadence and within the
-configured control budget. Never loop `squeue`, `sacct` or `fleetctl job status`
-to chase a faster response.
+Poll at the site's approved cadence and within the configured control budget.
+Never loop `squeue`, `sacct` or `fleetctl job status` to chase a faster
+response.
 
 - On a site with a `[control_budget]`, every control call spends a token.
   Exit 75 means the bucket is empty: wait the `retry_after` it reports (under
@@ -285,6 +278,11 @@ When the user wants to bring hosts into the fleet:
 - When one project needs an absolute path that does not follow
   `workdir/<project-name>` on some hosts, use repeated
   `--target-root target=/remote/path` entries on the project binding.
+- A host added to fleetctl is not yet monitored or schedulable. Fleetmon needs
+  its helper (`scripts/install-helper`), and fleetqd needs an enabled `[[node]]`
+  with reviewed evidence. Both are deliberate, per-target steps; see
+  [references/fleetmon.md](references/fleetmon.md) and
+  [references/fq.md](references/fq.md).
 
 ## Transport rules
 
@@ -293,7 +291,7 @@ When the user wants to bring hosts into the fleet:
 - Prefer `fleetctl exec` over `ssh <host> 'bash -lc ...'` when the user payload
   is naturally an argv vector on direct hosts.
 - On a `login` role, treat `fleetctl exec --admin` as control-plane access
-  only. Use `fleetctl submit` for compute.
+  only. Use `fleetctl submit` or `fq` for compute.
 - A refusal is the answer, not an obstacle. When `fleetctl` exits 2 it names the
   alternative; take that path, or ask. Do not reach for raw `ssh` to do the
   thing that was just refused, and do not add `--admin` to make a refusal go

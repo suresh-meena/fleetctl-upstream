@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `sync transfer` now stops with an uncertainty error after a dispatched peer
   rsync fails, instead of retrying a potentially partial write through relay;
   pre-transfer peer setup and probe failures can still fall back.
+- `remote-fleet-operator` skill: the description now names the requests that
+  should load it (free or busy GPUs, starting and stopping runs, logs, copying
+  checkpoints, KIAC/AMD/numpi), and the skill opens with a table that routes
+  each request to `fq`, fleetmon or `fleetctl`. It also lists the failures
+  seen when it was skipped, such as `nvidia-smi` sweeps, `nohup` worker
+  queues and `squeue` polling. The `fq` and fleetmon detail moved to
+  `references/fq.md` and `references/fleetmon.md`.
 
 ### Added
 - Optional `--expected-role workstation|login` on `fleetctl exec` and `sync push|pull`,

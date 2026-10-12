@@ -1,4 +1,4 @@
 interface:
   display_name: "Remote Fleet Operator"
-  short_description: "Run remote work through fleetctl instead of ad hoc SSH"
-  default_prompt: "Use $remote-fleet-operator to inspect the current fleet context, resolve the target protocol and queue rules, smoke test the target, sync code if needed, and run the requested remote work through fleetctl with the narrowest stable interface."
+  short_description: "GPUs, jobs and files on the user's fleet via fq, fleetmon and fleetctl"
+  default_prompt: "Use $remote-fleet-operator: route the request with its table (fq usage for free GPUs, fq submit/wait/logs for jobs, fleetctl for commands, file transfer and Slurm), check fq whoami and fleetctl doctor, then do the work through the narrowest stable interface."
