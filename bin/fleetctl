@@ -6859,7 +6859,7 @@ def enforce_control_budget(
         "rpc": {"submit": 12, "job": 6, "exec": 8, "script": 8, "sync": 6}.get(verb, 4),
         "sessions": session_cost
         if session_cost is not None
-        else {"submit": 3, "job": 2, "exec": 2, "script": 2, "sync": 3}.get(verb, 2),
+        else {"submit": 3, "job": 2, "exec": 2, "script": 2, "sync": 2}.get(verb, 2),
         "bytes": (sync_budget_bytes(args) if byte_cost is None else byte_cost)
         if verb == "sync"
         else 0,
