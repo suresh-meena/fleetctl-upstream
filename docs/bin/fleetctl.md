@@ -34,7 +34,7 @@ accident.
 | path | holds |
 | --- | --- |
 | `~/.config/fleet/` | `targets.d/` `pools.d/` `protocols.d/` `profiles.d/` `secrets/` `config.toml` `projects.toml` |
-| `~/.local/state/fleet/` | private `known_hosts`, `routes.json`, `jobs.jsonl`, `audit.jsonl`, probed `facts/` |
+| `~/.local/state/fleet/` | private `known_hosts`, `jobs.jsonl`, `audit.jsonl`, probed `facts/` |
 | `~/.cache/fleet/mux/` | SSH control sockets |
 
 `$FLEET_CONFIG_HOME`, `$FLEET_STATE_HOME` and `$FLEET_CACHE_HOME` move all
@@ -182,12 +182,12 @@ fleetctl doctor --probe    # also checks remote python3, which exec needs
 fleetctl probe <target>    # measure one host; doctor then reports the drift
 ```
 
-`migrate-config` rewrites an older inventory in place: it fills in `role`, makes
-`protocol` explicit, lifts a secret's `proxy_jump` into `reach` with `direct` in
-front of it, and strips the keys nothing reads any more — `transport`,
-`ssh_host_alias`, `metadata`, `job_runtime` and a pool's `strategy`. Those stay
-*accepted* so an unmigrated inventory still loads, and `doctor` names every file
-still carrying one.
+A target file, protocol, profile, pool, secret or `[defaults]` table carrying a key
+fleetctl does not read is refused as an unknown key, naming the file and the key.
+Keys that once meant something (`scheduler`, `transport`, `ssh_host_alias`,
+`metadata`, `job_runtime`, a pool's `strategy`, a secret's `proxy_jump`, ...) get
+no special treatment: delete them. Declare a bridge hop with `reach` on the
+target instead of `proxy_jump`.
 
 ## Daily
 
@@ -295,15 +295,10 @@ refused before staging or pruning.
 
 `host`, `user`, `port`, `auth`, `identity_file`, `password` and the SSH tuning
 knobs live in a secret, never in a target file — putting one in a target is a
-refusal with that explanation. Three backends: a private TOML file, a `pass`
-entry, an inline table, or a command fleetctl runs. Resolution is lazy.
-
-`secret_backend = "command"` runs `secret_ref` and reads the same TOML off its
-stdout, merged over the target's inline `[secret]` table — for the field that
-will not hold still, such as a cloud box whose address changes on every start.
-Cached 30 seconds in memory only, never on disk. Its stdout is a secret: it is
-redacted like any other, and a failing upcall is a refusal naming the command
-and its stderr rather than a half-resolved connection.
+refusal with that explanation. Two backends: a private TOML file
+(`secret_backend = "file"`, the default) or a `pass` entry
+(`secret_backend = "pass"`). Any other value, including the removed `inline` and
+`command`, is refused at load time with the supported list. Resolution is lazy.
 
 ```bash
 fleetctl show <target> --secret               # host and user both redacted
@@ -324,7 +319,14 @@ on the bridge, which every other host is reached through.
 ## Exit status
 
 `0` success · `1` `doctor` found problems · `2` any refusal, and any usage error
-· `130` interrupted. Anything else is the remote command's own.
+· `75` the central control-budget authority denied a permit · `130` interrupted.
+Anything else is the remote command's own.
+
+A protocol may declare `[control_budget]` only together with `authority_url` and
+`authority_token_file` (and optionally `canonical_cluster`); fleetctl asks that
+authority for a permit before it connects, or redeems the one in
+`FLEETCTL_PERMIT`. There is no per-machine budget: a `[control_budget]` without
+an authority is a config error, not an unbudgeted cluster.
 
 ## Shell integration
 

@@ -135,20 +135,6 @@ def test_confidence_field_carries_queue_evidence(fleetctl):
     assert conflicted_diag.level == "WARN"
 
 
-def test_inferred_confidence_on_unresolvable_command(fleetctl):
-    """FS002's 'command not found on this host' path is explicitly tagged
-    `inferred` -- it might be a real module-provided binary on the cluster,
-    so the tool should not claim more certainty than it has."""
-    script = fleetctl.parse_text(
-        "#!/bin/bash\n#SBATCH --partition=medium\n__totally_made_up_binary__ --flag\n"
-    )
-    rep = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep)
-    diag = [d for d in rep.items if d.rule_id == "FS002"][0]
-    assert diag.level == "INFO"
-    assert diag.confidence == fleetctl.CONF_INFERRED
-
-
 def test_text_renderer_keeps_the_line_of_a_one_line_diagnostic(fleetctl):
     rep = fleetctl.Report()
     diag = rep.error("SLURM003", "cannot tokenize #SBATCH line: No closing quotation", line=7)

@@ -70,6 +70,23 @@ def test_unrelated_bogus_defaults_key_is_still_rejected(fleetctl, tmp_path):
         )
 
 
+def test_formerly_deprecated_defaults_key_is_an_ordinary_unknown_key(fleetctl, tmp_path):
+    with pytest.raises(fleetctl.FleetError, match="unrecognised") as caught:
+        fleetctl.validate_config_file(
+            {"defaults": {"redact_sensitive_output": True}},
+            source=tmp_path / "config.toml",
+        )
+    assert "did you mean" not in str(caught.value)
+
+
+def test_formerly_deprecated_secret_key_is_an_ordinary_unknown_key(fleetctl, tmp_path):
+    with pytest.raises(fleetctl.FleetError, match="unrecognised.*proxy_jump"):
+        fleetctl.parse_secret_dict(
+            {"host": "h", "user": "u", "proxy_jump": "bridge"},
+            source=tmp_path / "s.toml",
+        )
+
+
 def test_local_target_alone_validates_cleanly(fleetctl, tmp_path):
     fleetctl.validate_config_file(
         {"defaults": {"local_target": "pi"}}, source=tmp_path / "config.toml"

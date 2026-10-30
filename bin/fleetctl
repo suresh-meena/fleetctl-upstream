@@ -15,7 +15,6 @@ import datetime
 import difflib
 import fcntl
 import json
-import math
 import os
 import posixpath
 import re
@@ -153,11 +152,11 @@ DENY_REASON = {
 
 
 def resolve_role(target: "TargetRecord", protocol: "ProtocolRecord") -> str:
-    """Return TARGET's role, inferring one only while configs are unmigrated.
+    """Return TARGET's role, inferring one when the target declares none.
 
     An explicit `role` always wins.  Without one, infer the safety level the
-    protocol already implied -- so an unmigrated fleet is never *less* guarded
-    than it was before roles existed -- and let `doctor` ask for a migration.
+    protocol already implied -- so a target with no role is never *less* guarded
+    than it was before roles existed -- and let `doctor` ask for it to be named.
     """
     if target.role:
         return target.role
@@ -339,9 +338,9 @@ class FleetTimeout(FleetError):
 
 
 class BudgetRefused(FleetError):
-    """Raised when a control-budget check (local bucket or central authority) denies a request.
+    """Raised when the central control-budget authority denies a request.
 
-    `scope` is "local" or "central", `reason` is a short machine word (e.g.
+    `scope` is "central", `reason` is a short machine word (e.g.
     "authority_unavailable") for the cases where denial is not simply "no tokens
     left", and `retry_after` is the caller's best estimate of how long to wait
     before trying again -- seconds, or None when no useful estimate exists (a
@@ -482,7 +481,6 @@ class TargetRecord:
     tags: tuple[str, ...] = ()
     secret_backend: str = "file"
     secret_ref: str | None = None
-    secret_inline: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
     # Read by resolve_profile, between the project binding and the protocol.
     default_profile: str | None = None
@@ -561,27 +559,20 @@ class QueueRecord:
 
 @dataclass(frozen=True)
 class ControlBudgetRecord:
-    """A managed cluster's rate limit on control-plane traffic (`[control_budget]`).
+    """A managed cluster's central control-plane budget (`[control_budget]`).
 
-    Two layers, and either or both may apply: a local interim token bucket
-    (`*_per_minute`/`burst`, enforced entirely on this machine -- a per-machine
-    safeguard, not a fleet-wide guarantee, which is why every outcome that uses
-    it is labelled `budget_scope = "local"`), and, when AUTHORITY_URL is also
-    set, a central authority this machine asks permission of first.  See
-    acquire_local_budget/authority_request_permit.
+    The budget is enforced by a central authority that this machine asks for a
+    permit before anything connects; there is no per-machine fallback.  See
+    authority_request_permit/authority_redeem_permit.
     """
 
-    monitor_per_minute: float | None = None
-    action_per_minute: float | None = None
-    transfer_per_minute: float | None = None
-    burst: float | None = None
     # Every login endpoint of one site shares a bucket by default: the bucket
     # is keyed on this, not on the target or protocol name, so two protocols
     # naming the same cluster (a primary and a DR login node, say) still share
     # one budget rather than each getting their own for free.
-    canonical_cluster: str = ""
-    authority_url: str | None = None
-    authority_token_file: str | None = None
+    canonical_cluster: str
+    authority_url: str
+    authority_token_file: str
 
 
 @dataclass(frozen=True)
@@ -681,8 +672,8 @@ class FleetContext:
     # The route each target's control master actually came up over, this run only.
     # Written where routes are chosen and read where a hop is rendered, so a
     # bridge reached over its own fallback carries traffic on the socket that came
-    # up rather than the one declared first.  In memory and deliberately not in
-    # routes.json: a remembered route that outlived the process would pin later
+    # up rather than the one declared first.  In memory and deliberately not
+    # persisted: a remembered route that outlived the process would pin later
     # commands to the bridge, which is the opposite of preferring direct.
     route_established: dict[str, str] = field(default_factory=dict)
 
@@ -1118,9 +1109,7 @@ class FleetContext:
     def protocol_for(self, target: TargetRecord) -> ProtocolRecord:
         """Look up TARGET's protocol without judging whether the two agree.
 
-        Only migrate-config wants this: it has to read a stale target's protocol
-        in order to repair the target, so it cannot require the target to already
-        be coherent.  Everything else goes through resolve_protocol().
+        Callers that need the pair to be coherent go through resolve_protocol().
         """
         chosen = target.protocol
         if chosen is None:
@@ -1145,11 +1134,8 @@ class FleetContext:
     ) -> tuple[dict[str, Any], Path | None]:
         """Fetch TARGET's secret material as written, and say where it came from.
 
-        Only the migration wants this: it has to read a key the parsed record no
-        longer carries.  Everything else goes through resolve_secret().
+        Everything outside the secret loaders goes through resolve_secret().
         """
-        if target.secret_backend == "inline":
-            return dict(target.secret_inline), None
         if not target.secret_ref:
             raise FleetError(f"target {target.name!r} is missing `secret_ref`")
         if target.secret_backend == "file":
@@ -1157,21 +1143,9 @@ class FleetContext:
             return load_toml_file(path), path
         if target.secret_backend == "pass":
             return parse_secret_blob(run_pass_show(target.secret_ref)), None
-        if target.secret_backend == "command":
-            # Merged over the inline table rather than replacing it, because the
-            # point is to supply *a field*.  Everything stable about the host
-            # stays written down in the target's `[secret]`, and the upcall
-            # answers only the question that has a different answer today.
-            values = dict(target.secret_inline)
-            values.update(
-                run_secret_command(
-                    target.secret_ref, what=f"target {target.name!r}"
-                )
-            )
-            return values, None
         raise FleetError(
             f"target {target.name!r} uses unsupported secret backend "
-            f"{target.secret_backend!r}"
+            f"{target.secret_backend!r}; supported: {', '.join(SECRET_BACKENDS)}"
         )
 
     def resolve_secret(self, target: TargetRecord) -> FleetSecret:
@@ -2085,7 +2059,8 @@ def has_shell_var(value: str | None) -> bool:
 def parse_time(value: Any) -> int | None:
     """Seconds for a Slurm time spec, -1 for unlimited, None if unparseable.
 
-    Accepts [DD-]HH:MM:SS, MM:SS, and bare-minutes forms.
+    Accepts [DD-]HH:MM:SS, MM:SS, and bare-minutes forms.  With a day prefix
+    the shorter forms shift to Slurm's D-HH and D-HH:MM (days-hours[:minutes]).
     """
     if value is None:
         return None
@@ -2095,7 +2070,8 @@ def parse_time(value: Any) -> int | None:
     if text in ("-1", "infinite", "unlimited", "UNLIMITED", "INFINITE"):
         return -1
     days = 0
-    if "-" in text:
+    has_days = "-" in text
+    if has_days:
         day_part, _, text = text.partition("-")
         if not day_part.isdigit():
             return None
@@ -2105,9 +2081,9 @@ def parse_time(value: Any) -> int | None:
         return None
     nums = [int(p) for p in parts]
     if len(nums) == 1:
-        hours, minutes, seconds = 0, nums[0], 0
+        hours, minutes, seconds = (nums[0], 0, 0) if has_days else (0, nums[0], 0)
     elif len(nums) == 2:
-        hours, minutes, seconds = 0, nums[0], nums[1]
+        hours, minutes, seconds = (nums[0], nums[1], 0) if has_days else (0, nums[0], nums[1])
     else:
         hours, minutes, seconds = nums
     return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
@@ -2161,30 +2137,65 @@ def canonical_memory(value: Any) -> str | None:
     return f"{number}{suffix}"
 
 
-def expand_hostlist(spec: str, limit: int = 4096) -> list[str]:
-    """Expand 'cn[7-9]' / 'cn[1,4]' style hostlists (no zero-pad beyond the source width)."""
-    spec = (spec or "").strip()
-    if not spec:
-        return []
-    match = re.search(r"\[([^\]]*)\]", spec)
-    if not match:
-        return [spec]
-    base = spec[: match.start()]
+def _split_top_level(spec: str) -> list[str]:
+    """Split on commas that are not inside [...] brackets."""
+    items: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(spec):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            items.append(spec[start:index])
+            start = index + 1
+    items.append(spec[start:])
+    return items
+
+
+def _expand_bracket(body: str) -> list[str]:
+    """Expand the inside of one [...] group: '1-3,7' -> ['1', '2', '3', '7'] (zero padding kept)."""
     out: list[str] = []
-    for item in match.group(1).split(","):
+    for item in body.split(","):
         item = item.strip()
         if not item:
             continue
-        if "-" in item:
-            lo, _, hi = item.partition("-")
-            if lo.isdigit() and hi.isdigit():
-                width = len(lo)
-                for n in range(int(lo), int(hi) + 1):
-                    out.append(f"{base}{str(n).zfill(width)}")
-            else:
-                out.append(base + item)
+        lo, _, hi = item.partition("-")
+        if "-" in item and lo.isdigit() and hi.isdigit():
+            width = len(lo)
+            out.extend(str(n).zfill(width) for n in range(int(lo), int(hi) + 1))
         else:
-            out.append(base + item)
+            out.append(item)
+    return out
+
+
+def expand_hostlist(spec: str, limit: int = 4096) -> list[str]:
+    """Expand 'cn[7-9]b' / 'cn[1,4]' / 'cn7,cn[9-10]' style hostlists.
+
+    Top-level commas separate hosts, commas inside brackets do not; every
+    bracket group in a name expands (cartesian product) and any text after
+    `]` is kept.  Ranges keep the zero padding of their low end.
+    """
+    out: list[str] = []
+    for item in _split_top_level((spec or "").strip()):
+        item = item.strip()
+        if not item:
+            continue
+        names = [""]
+        rest = item
+        while rest:
+            match = re.search(r"\[([^\]]*)\]", rest)
+            if not match:
+                names = [name + rest for name in names]
+                break
+            head = rest[: match.start()]
+            values = _expand_bracket(match.group(1))
+            names = [name + head + value for name in names for value in values]
+            rest = rest[match.end() :]
+            if len(names) > limit:
+                names = names[:limit]
+        out.extend(names)
         if len(out) > limit:
             return out[:limit]
     return out
@@ -2198,7 +2209,6 @@ def expand_hostlist(spec: str, limit: int = 4096) -> list[str]:
 # Stage 2  shell syntax (bash -n, optional shellcheck)
 # Stage 3  directive semantics (time, counts, memory, output, array, dependency)
 # Stage 4  GPU/GRES syntax (site/type validity is a site-rules question)
-# Stage 6  filesystem references (chdir, cd, output dirs, commands)
 # ---------------------------------------------------------------------------
 
 KNOWN_LONG = frozenset(
@@ -2219,6 +2229,8 @@ KNOWN_LONG = frozenset(
     --sockets-per-node --spread-job --switches --threads-per-core --time
     --time-min --tmp --tres-bind --tres-per-task --uid --wait --wckey --wrap
     --x11
+    --container --container-id --propagate --thread-spec --use-min-nodes
+    --wait-all-nodes
     """.split()
 )
 
@@ -2282,8 +2294,8 @@ class _CommandRunner:
     """Subprocess facade that never raises; (returncode, combined output).
 
     Used only for commands that run locally against the script file on this
-    machine -- bash -n, shellcheck, `module show` -- never over SSH.  A
-    missing binary becomes a diagnostic (SH001/SH100/MOD001), not a crash.
+    machine -- bash -n, shellcheck -- never over SSH.  A missing binary
+    becomes a diagnostic (SH001/SH100), not a crash.
     """
 
     def __init__(self, timeout: float = 20.0) -> None:
@@ -2649,174 +2661,6 @@ def _check_task_geometry(script: ParsedScript, rep: Report) -> None:
         )
 
 
-# ---- Stage 6: filesystem references -----------------------------------------
-
-
-def check_filesystem(script: ParsedScript, rep: Report) -> None:
-    """Report paths the script names that do not exist on this machine.
-
-    Informational only, never a refusal.  fleetctl checks a script on the
-    machine it is typed on and runs it on another one, so `/storage/...`
-    missing here says nothing about the cluster -- and when these were errors,
-    every job with an absolute cluster path was refused, which left
-    `--no-preflight` as the only way through and switched the account checks
-    off with them.  They stay as hints because a typo in a path the operator
-    also has locally is still worth pointing at.
-    """
-    chdir = script.get("--chdir")
-    if chdir:
-        target = os.path.expanduser(chdir)
-        if os.path.isabs(target) and not os.path.isdir(target):
-            chdir_d = script.directive_for("--chdir")
-            rep.info(
-                "FS001",
-                f"--chdir target does not exist on this machine: {target}",
-                line=chdir_d.line_no if chdir_d else None,
-                excerpt=chdir_d.raw if chdir_d else None,
-                suggestion="create it, or point at the recommended storage area",
-            )
-    for line_no, text in script.body_lines:
-        match = re.match(r"^cd\s+([^\s;&|]+)", text)
-        if not match:
-            continue
-        target = os.path.expanduser(match.group(1))
-        if target.startswith("$") or not os.path.isabs(target):
-            continue
-        if not os.path.isdir(target):
-            rep.info(
-                "FS001",
-                f"cd target does not exist on this machine: {target}",
-                line=line_no,
-                excerpt=text,
-            )
-    for option in ("--output", "--error"):
-        for directive in script.get_all(option):
-            value = directive.value or ""
-            dirpart = os.path.dirname(value)
-            if not dirpart or dirpart == ".":
-                continue
-            # sbatch requires the output directory to exist at submit time,
-            # even when the filename itself uses %j-style patterns
-            if not os.path.isdir(_resolve_exists_dir(dirpart, chdir, script.path)):
-                rep.info(
-                    "FS003",
-                    f"directory for {option} does not exist on this machine: {dirpart}",
-                    line=directive.line_no,
-                    suggestion=f"mkdir -p {dirpart} in the submission directory before "
-                    "submitting (sbatch opens output files at submit time)",
-                )
-    for line_no, text in _iter_command_lines(script):
-        words = text.split()
-        if not words:
-            continue
-        exe = words[0]
-        if "/" in exe:
-            if not _resolve_exists(exe, chdir, script.path):
-                rep.info(
-                    "FS002",
-                    f"executable path does not exist on this machine: {exe}",
-                    line=line_no,
-                    excerpt=text,
-                )
-        elif shutil.which(exe) is None:
-            rep.info(
-                "FS002",
-                f"command '{exe}' not found on this machine; fine if it exists where the job runs",
-                line=line_no,
-                excerpt=text,
-                confidence=CONF_INFERRED,
-            )
-        if words[0] in ("python", "python3", "python2") and len(words) > 1:
-            arg = words[1]
-            if arg.startswith(("./", "../", "/")) and not _resolve_exists(arg, chdir, script.path):
-                rep.info(
-                    "FS002",
-                    f"script argument not found on this machine: {arg}",
-                    line=line_no,
-                    excerpt=text,
-                    confidence=CONF_INFERRED,
-                )
-
-
-def _resolve_exists_dir(dirpart: str, chdir: str | None, script_path: str) -> str:
-    if os.path.isabs(dirpart):
-        return dirpart
-    if chdir and not chdir.startswith("$"):
-        base = os.path.expanduser(chdir)
-        if os.path.isdir(base):
-            return os.path.join(base, dirpart)
-    return os.path.join(os.path.dirname(os.path.abspath(script_path)), dirpart)
-
-
-def _resolve_exists(path: str, chdir: str | None, script_path: str) -> bool:
-    expanded = os.path.expanduser(path)
-    if not os.path.isabs(expanded):
-        base = os.path.expanduser(chdir) if chdir and not chdir.startswith("$") else os.path.dirname(os.path.abspath(script_path))
-        expanded = os.path.join(os.path.expanduser(base) if not os.path.isabs(base) else base, expanded)
-    return os.path.exists(expanded)
-
-
-def _iter_command_lines(script: ParsedScript) -> Iterable[tuple[int, str]]:
-    for line_no, text in script.body_lines:
-        stripped = text.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        while True:
-            match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+", stripped)
-            if not match:
-                break
-            stripped = stripped[match.end():].strip()
-        if not stripped:
-            continue
-        if stripped.startswith(("cd ", "cd\t", "module ", "module\t", "source ", ". ", "export ", "set ")):
-            continue
-        if any(op in stripped for op in (";", "&&", "||", "|", ">>", ">")):
-            continue
-        yield line_no, stripped
-
-
-# ---- Stage 6b: module resolution (only when the module command is available) --
-
-_MODULE_LOAD_RE = re.compile(r"^module\s+load\s+(.+)$")
-
-
-def check_modules(script: ParsedScript, rep: Report, runner: Any = None) -> None:
-    if runner is None:
-        runner = _CommandRunner()
-    loads: list[tuple[int, str, list[str]]] = []
-    for line_no, text in script.body_lines:
-        match = _MODULE_LOAD_RE.match(text.strip())
-        if match:
-            names = shlex.split(match.group(1))
-            loads.append((line_no, text, [n for n in names if not n.startswith("-")]))
-    if not loads:
-        return
-
-    rc, _ = runner.run(["bash", "-lc", "type module"])
-    if rc != 0:
-        rep.info(
-            "MOD001",
-            f"module command not available here; {sum(len(n) for _, _, n in loads)} "
-            "module load(s) left unchecked (verify with `module avail` on the login node)",
-        )
-        return
-    for line_no, text, names in loads:
-        for name in names:
-            quoted = shlex.quote(name)
-            rc, _out = runner.run(["bash", "-lc", f"module show {quoted} >/dev/null 2>&1"])
-            if rc == 0:
-                rep.pass_("MOD002", f"module '{name}' resolvable", line=line_no)
-            else:
-                rep.warn(
-                    "MOD002",
-                    f"module '{name}' not found by `module show`",
-                    line=line_no,
-                    excerpt=text,
-                    suggestion="check `module avail` on the login node; never trust "
-                    "module versions printed in documentation",
-                )
-
-
 # ---------------------------------------------------------------------------
 # GPU request extraction (shared with site rules)
 # ---------------------------------------------------------------------------
@@ -2899,7 +2743,7 @@ def check_site_policy(script: ParsedScript, rep: Report, protocol: ProtocolRecor
     """Run every site-policy rule for the queue named by the script's --partition."""
     part = script.get("--partition")
     part_d = script.directive_for("--partition")
-    queue = protocol.queue_named(part) if part else None
+    queue = protocol.queue_named(part) if part and "," not in part else None
 
     _check_site_partition(rep, protocol, part, part_d, queue)
     _check_site_account(script, rep, protocol, part, part_d, queue)
@@ -2924,6 +2768,36 @@ def _check_site_partition(
             _rid(protocol, "001"),
             f"no --partition directive; {protocol.name} usage requires an explicit partition",
             suggestion="pick a documented queue; do not assume a cluster default",
+        )
+        return
+    names = [name.strip() for name in part.split(",") if name.strip()]
+    if len(names) > 1:
+        # Slurm accepts --partition=a,b; check each name.  Per-queue limits are
+        # not applied to a list (the scheduler picks one), so say so.
+        unknown = [name for name in names if protocol.queue_named(name) is None]
+        if unknown:
+            rep.error(
+                _rid(protocol, "011"),
+                f'"--partition={part}" names {", ".join(unknown)}, not a documented queue for '
+                f"{protocol.name}; it cannot be verified offline",
+                line=part_d.line_no if part_d else None,
+                excerpt=part_d.raw if part_d else None,
+                suggestion="use documented partitions, or verify with a real submission",
+                confidence=CONF_DOCUMENTED,
+            )
+            return
+        rep.pass_(
+            _rid(protocol, "010"),
+            f"partitions {', '.join(names)} are documented for {protocol.name}",
+            line=part_d.line_no if part_d else None,
+            confidence=CONF_DOCUMENTED,
+        )
+        rep.info(
+            _rid(protocol, "012"),
+            "--partition lists several queues; per-queue account, QOS, time and GPU limits "
+            "are not checked for a list",
+            line=part_d.line_no if part_d else None,
+            confidence=CONF_DOCUMENTED,
         )
         return
     if queue is None:
@@ -3000,8 +2874,7 @@ def _check_site_account_policy(
     acc = script.directive_for("--account")
     if acc is None or not acc.value:
         return
-    conf = queue.evidence or CONF_DOCUMENTED
-    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    conf, tag = _queue_conf_and_tag(queue)
     if acc.value in queue.denied_accounts or (
         queue.allowed_accounts and acc.value not in queue.allowed_accounts
     ):
@@ -3035,8 +2908,7 @@ def _check_site_qos(
         return
     required = queue.required_qos
     qos_d = script.directive_for("--qos")
-    conf = queue.evidence or CONF_DOCUMENTED
-    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    conf, tag = _queue_conf_and_tag(queue)
     if qos_d is None or not qos_d.value:
         rep.error(
             _rid(protocol, "024"),
@@ -3100,8 +2972,7 @@ def _check_site_time(
     if max_seconds is None or max_seconds < 0:
         return
     evidence = queue.evidence
-    conf = evidence or CONF_DOCUMENTED
-    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    conf, tag = _queue_conf_and_tag(queue)
     verified = evidence in (CONF_VERIFIED_BY_RUN, CONF_VERIFIED_LIVE)
     disputed = evidence == CONF_CONFLICT
 
@@ -3163,6 +3034,12 @@ def _check_site_time(
             )
 
 
+def _queue_conf_and_tag(queue: QueueRecord) -> tuple[str, str]:
+    """A queue's evidence class (documented unless stated) and its "as of" suffix."""
+    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    return queue.evidence or CONF_DOCUMENTED, tag
+
+
 def _check_site_storage(script: ParsedScript, rep: Report, protocol: ProtocolRecord) -> None:
     preferred = protocol.preferred_storage
     if not preferred:
@@ -3211,8 +3088,7 @@ def _check_site_gpu_types(
     types = {g.casefold() for g in queue.gres_types}
     evidence = queue.evidence
     verified = evidence in (CONF_VERIFIED_BY_RUN, CONF_VERIFIED_LIVE)
-    conf = evidence or CONF_DOCUMENTED
-    tag = f" (as of {queue.as_of})" if queue.as_of else ""
+    conf, tag = _queue_conf_and_tag(queue)
     for line_no, raw, gtype, _count in iter_gpu_requests(script):
         if gtype is None:
             continue
@@ -3339,7 +3215,6 @@ def preflight_script(
     protocol: ProtocolRecord,
     strict: bool = False,
     shellcheck: bool = False,
-    check_paths: bool = True,
 ) -> Report:
     """Run the full offline batch-script preflight and return its Report.
 
@@ -3357,9 +3232,6 @@ def preflight_script(
     check_structure(script, rep)
     check_shell(str(path), rep, shellcheck=("on" if shellcheck else "off"))
     check_generic(script, rep)
-    if check_paths:
-        check_filesystem(script, rep)
-    check_modules(script, rep)
     if protocol.kind == "slurm":
         check_site_policy(script, rep, protocol)
 
@@ -3554,11 +3426,7 @@ def capability_preflight(plan: "Plan", args: argparse.Namespace) -> None:
         declared = capability_number(capabilities.get(key))
         if declared is None or requested <= declared:
             continue
-        where = (
-            f"{plan.target.name!r} queue {plan.queue.name!r}"
-            if plan.queue is not None
-            else repr(plan.target.name)
-        )
+        where = f"{plan.target.name!r} queue {plan.queue.name!r}"
         raise FleetError(
             f"{flag} {capability_text(getattr(args, attr))} exceeds {where}, which "
             f"declares {key} = {capability_text(capabilities[key])}. Fix the "
@@ -4148,7 +4016,6 @@ TARGET_KEYS = frozenset(
         "tags",
         "secret_backend",
         "secret_ref",
-        "secret",
         "capabilities",
         "default_profile",
     }
@@ -4181,10 +4048,6 @@ PROTOCOL_KEYS = frozenset(
 )
 CONTROL_BUDGET_KEYS = frozenset(
     {
-        "monitor_per_minute",
-        "action_per_minute",
-        "transfer_per_minute",
-        "burst",
         "canonical_cluster",
         "authority_url",
         "authority_token_file",
@@ -4279,11 +4142,7 @@ SECRET_KEYS = frozenset(
     }
 )
 
-# `command` runs `secret_ref` and reads TOML off its stdout.  It exists for the
-# field that will not hold still -- a cloud box whose address changes on every
-# start -- and it keeps that knowledge in a script the operator already has
-# rather than making fleetctl learn one provider's API and then the next one's.
-SECRET_BACKENDS = ("file", "pass", "inline", "command")
+SECRET_BACKENDS = ("file", "pass")
 PROTOCOL_KINDS = ("direct", "slurm")
 GPU_REQUEST_MODES = ("none", "gpus", "gres")
 GPU_VENDORS = ("nvidia", "amd", "intel")
@@ -4303,80 +4162,6 @@ EVIDENCE_CLASSES = (
 AUTH_MODES = ("key", "password")
 STRICT_HOST_KEY_MODES = ("yes", "no", "off", "ask", "accept-new")
 
-# Keys that used to mean something and no longer do.  Four fields described one
-# property -- "does compute here go through a scheduler" -- and disagreed with
-# each other; `role` and `submit_command` now answer it once each.  They stay
-# *accepted* so an unmigrated fleet keeps loading, but nothing reads them, and
-# `doctor` names every file still carrying one.  Tolerating a key is a decision,
-# so it is written down here rather than hidden as a stray entry in a key set.
-DEPRECATED_TARGET_KEYS: dict[str, str] = {
-    "scheduler": "what may run here is decided by `role`; `protocol` is required",
-    "transport": (
-        "there was one value, `ssh`, and nothing ever branched on it. A second "
-        "transport would have to change how commands, copies and control sockets "
-        "are built, none of which a key in a target file could reach"
-    ),
-    "ssh_host_alias": (
-        "it never reached an ssh invocation, and could not: a fleet connection is "
-        "built from the secret and deliberately ignores `~/.ssh/config`, which is "
-        "what `IdentitiesOnly` and a private `known_hosts` are for. A real `Host` "
-        "alias is expressible as `[ssh_option]` in the secret"
-    ),
-    "metadata": (
-        "a free-form table nothing read. The two things people put in it are "
-        "already modelled by something that acts on them: `tags` to group hosts, "
-        "`[capabilities]` to describe the hardware"
-    ),
-}
-DEPRECATED_PROTOCOL_KEYS: dict[str, str] = {
-    "scheduler_required": "the role matrix decides this for every verb",
-    "allow_login_exec": "the role matrix decides this; pass --admin per command",
-    "smoke_gpu_probe": (
-        "whether a host has a GPU is a fact about the host, not about the site "
-        'protocol shared by all of them; declare `gpu_count` under the target\'s '
-        "`[capabilities]` and `smoke` follows it"
-    ),
-    "job_runtime": (
-        "nothing ever read it, and a second runtime dimension is the wrong shape "
-        "anyway: how work is invoked belongs to the profile that invokes it, so a "
-        'container is an `interpreter` or a `submit_command` beginning '
-        '["apptainer", "exec", ...] -- one place, and one that `--dry-run` prints'
-    ),
-}
-DEPRECATED_POOL_KEYS: dict[str, str] = {
-    "strategy": (
-        "`ordered` was the only value left. The one it replaced, `random`, was "
-        "re-rolled on every call, so `sync push` landed the code on one member "
-        "and the `submit` after it queued the job on another. Selection takes the "
-        "first enabled member, and `--require`/`--fit` are how you ask for a "
-        "different one -- repeatably, and for a stated reason"
-    ),
-    "default_profile": (
-        "profile resolution never saw the pool, so this was unreachable; set it "
-        "on the target, the protocol, or the project binding"
-    ),
-}
-DEPRECATED_PROFILE_KEYS: dict[str, str] = {
-    "kind": "derived from whether the profile defines `submit_command`",
-}
-DEPRECATED_SECRET_KEYS: dict[str, str] = {
-    "proxy_jump": (
-        "how a host is reached is inventory, not a credential; declare "
-        '`reach = ["direct", "via:<bridge>"]` on the target instead, which is '
-        "validated at load time, reported by `list --format topology`, and "
-        "carries the bridge's own fleet SSH settings. A waypoint that is not "
-        "itself a fleet target is still expressible as `[ssh_option] ProxyJump`"
-    ),
-}
-DEPRECATED_CONFIG_DEFAULTS_KEYS: dict[str, str] = {
-    "redact_sensitive_output": (
-        "nothing ever read it; `show --secret` redacts by default and "
-        "`--sensitive` asks for the real values one command at a time, which "
-        "beats a global switch that silently changes what every command prints"
-    ),
-}
-
-
 def reject_unknown_keys(
     raw: dict[str, Any],
     known: Iterable[str],
@@ -4384,16 +4169,13 @@ def reject_unknown_keys(
     what: str,
     source: Path | None = None,
     guidance: dict[str, str] | None = None,
-    deprecated: dict[str, str] | None = None,
 ) -> None:
     """Fail on any key the loader would otherwise ignore.
 
-    DEPRECATED keys are accepted and ignored -- never suggested as a correction,
-    because steering a typo towards a dead field is worse than no suggestion.
+    A correction is only ever suggested from the keys the loader reads.
     """
     known_keys = sorted(known)
-    tolerated = set(known_keys) | set(deprecated or ())
-    unknown = sorted(key for key in raw if key not in tolerated)
+    unknown = sorted(key for key in raw if key not in known_keys)
     if not unknown:
         return
     hints: list[str] = []
@@ -4470,7 +4252,6 @@ def validate_config_file(raw: dict[str, Any], *, source: Path) -> None:
         CONFIG_DEFAULTS_KEYS,
         what="fleet config `[defaults]`",
         source=source,
-        deprecated=DEPRECATED_CONFIG_DEFAULTS_KEYS,
     )
     ssh_section = check_table(raw.get("ssh", {}), what="`ssh`", source=source)
     reject_unknown_keys(
@@ -4537,6 +4318,7 @@ TARGET_FILE_WARNINGS: dict[str, str] = {
     "port": "sensitive connection material belongs in secret records",
     "password": "sensitive connection material belongs in secret records",
     "identity_file": "sensitive connection material belongs in secret records",
+    "secret": "an inline secret table is not supported; use a secret file and `secret_ref`",
 }
 
 
@@ -4552,7 +4334,6 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
             what=what,
             source=source,
             guidance=TARGET_FILE_WARNINGS,
-            deprecated=DEPRECATED_TARGET_KEYS,
         )
         # fleetctl used to fall back to `scheduler` when `protocol` was absent, so
         # the obvious way to add a Slurm box -- tags and no protocol -- produced a
@@ -4588,9 +4369,6 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
                 source=source,
             ),
             secret_ref=optional_str(raw.get("secret_ref")),
-            secret_inline=check_table(
-                raw.get("secret", {}), what=f"`secret` for {what}", source=source
-            ),
             capabilities=parse_capabilities(
                 raw.get("capabilities", {}),
                 what=f"`[capabilities]` for {what}",
@@ -4613,7 +4391,6 @@ def load_pools(path: Path) -> dict[str, PoolRecord]:
             POOL_KEYS,
             what=what,
             source=source,
-            deprecated=DEPRECATED_POOL_KEYS,
         )
         pool = PoolRecord(
             name=name,
@@ -4672,27 +4449,15 @@ def parse_control_budget(
         what=f"`[control_budget]` in {what}",
         source=source,
     )
-    rates = {
-        key: optional_float(table.get(key))
-        for key in ("monitor_per_minute", "action_per_minute", "transfer_per_minute")
-    }
-    burst = optional_float(table.get("burst"))
-    for key, value in rates.items():
-        if value is not None and (not math.isfinite(value) or value <= 0):
-            raise FleetError(f"`{key}` in `{what}` must be finite and greater than zero")
-    if burst is not None and (not math.isfinite(burst) or burst <= 0):
-        raise FleetError(f"`burst` in `{what}` must be finite and greater than zero")
     authority_url = optional_str(table.get("authority_url"))
     authority_token_file = optional_str(table.get("authority_token_file"))
-    if bool(authority_url) != bool(authority_token_file):
+    if not authority_url or not authority_token_file:
         raise FleetError(
-            f"`authority_url` and `authority_token_file` in `{what}` must be configured together"
+            f"control_budget requires authority_url and authority_token_file "
+            f"(`[control_budget]` in {what}); fleetctl has no per-machine budget, "
+            "so a budget without a central authority would silently budget nothing"
         )
     return ControlBudgetRecord(
-        monitor_per_minute=rates["monitor_per_minute"],
-        action_per_minute=rates["action_per_minute"],
-        transfer_per_minute=rates["transfer_per_minute"],
-        burst=burst,
         canonical_cluster=optional_str(table.get("canonical_cluster")) or protocol_name,
         authority_url=authority_url,
         authority_token_file=authority_token_file,
@@ -4710,7 +4475,6 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             PROTOCOL_KEYS,
             what=what,
             source=source,
-            deprecated=DEPRECATED_PROTOCOL_KEYS,
         )
         queues: list[QueueRecord] = []
         for item in raw.get("queue", []):
@@ -4729,16 +4493,10 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
                 raise FleetError(
                     f"protocol {name!r} has a queue without `name`/`partition`"
                 )
-            directives = item.get("directive", item.get("directives", []))
-            if isinstance(directives, str):
-                directive_values = (directives,)
-            else:
-                directive_values = tuple(str(value) for value in directives)
-            notes = item.get("notes", [])
-            if isinstance(notes, str):
-                note_values = (notes,)
-            else:
-                note_values = tuple(str(value) for value in notes)
+            directive_values = verbatim_str_tuple(
+                item.get("directive", item.get("directives", []))
+            )
+            note_values = verbatim_str_tuple(item.get("notes", []))
             queues.append(
                 QueueRecord(
                     name=queue_name,
@@ -4781,16 +4539,8 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
                     ),
                 )
             )
-        docs = raw.get("docs", [])
-        if isinstance(docs, str):
-            doc_values = (docs,)
-        else:
-            doc_values = tuple(str(value) for value in docs)
-        notes = raw.get("notes", [])
-        if isinstance(notes, str):
-            note_values = (notes,)
-        else:
-            note_values = tuple(str(value) for value in notes)
+        doc_values = verbatim_str_tuple(raw.get("docs", []))
+        note_values = verbatim_str_tuple(raw.get("notes", []))
         kind = check_vocabulary(
             str(raw.get("kind", "direct")),
             PROTOCOL_KINDS,
@@ -4875,7 +4625,6 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
             PROFILE_KEYS,
             what=what,
             source=source,
-            deprecated=DEPRECATED_PROFILE_KEYS,
         )
         submit = tuple(str(item) for item in raw.get("submit_command", []))
         status = tuple(str(item) for item in raw.get("status_command", []))
@@ -4892,14 +4641,10 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
             what=f"`[environment]` for {what}",
             source=source,
         )
-        if isinstance(script, dict):
-            interpreter = optional_str(script.get("interpreter"))
-            remote_script_root = str(
-                script.get("remote_script_root", DEFAULT_SCRIPT_REMOTE_ROOT)
-            )
-        else:
-            interpreter = "/usr/bin/env bash"
-            remote_script_root = DEFAULT_SCRIPT_REMOTE_ROOT
+        interpreter = optional_str(script.get("interpreter"))
+        remote_script_root = str(
+            script.get("remote_script_root", DEFAULT_SCRIPT_REMOTE_ROOT)
+        )
         profiles[name] = ProfileRecord(
             name=name,
             interpreter=interpreter,
@@ -5028,39 +4773,6 @@ def queue_evidence_warnings(protocols: dict[str, ProtocolRecord]) -> list[str]:
     return warnings
 
 
-def deprecated_key_warnings(paths: FleetPaths) -> list[str]:
-    """Name every config file still carrying a key nothing reads."""
-    warnings: list[str] = []
-    for directory, dead in (
-        (paths.targets_dir, DEPRECATED_TARGET_KEYS),
-        (paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
-        (paths.pools_dir, DEPRECATED_POOL_KEYS),
-        (paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
-        # Only the key name is ever reported, never a value: a secret file is
-        # named and inspected here, not printed.
-        (paths.secrets_dir, DEPRECATED_SECRET_KEYS),
-    ):
-        if not directory.exists():
-            continue
-        for entry in sorted(directory.glob("*.toml")):
-            raw = load_toml_file(entry, default={})
-            for key, why in dead.items():
-                if key in raw:
-                    warnings.append(
-                        f"{entry} still defines `{key}`, which fleetctl ignores: "
-                        f"{why}. Run `fleetctl migrate-config`."
-                    )
-    config_defaults = load_toml_file(paths.config_file, default={}).get("defaults")
-    if isinstance(config_defaults, dict):
-        for key, why in DEPRECATED_CONFIG_DEFAULTS_KEYS.items():
-            if key in config_defaults:
-                warnings.append(
-                    f"{paths.config_file} still defines `[defaults] {key}`, which "
-                    f"fleetctl ignores: {why}. Run `fleetctl migrate-config`."
-                )
-    return warnings
-
-
 def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> FleetSecret:
     """Parse one secret record from TOML-style data."""
     # A typo here is quiet and dangerous in a different way to the other
@@ -5072,7 +4784,6 @@ def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> Fle
         SECRET_KEYS,
         what="secret record",
         source=source,
-        deprecated=DEPRECATED_SECRET_KEYS,
     )
     host = optional_str(raw.get("host"))
     user = optional_str(raw.get("user"))
@@ -5123,10 +4834,7 @@ def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> Fle
 
 
 def parse_secret_blob(text: str) -> dict[str, Any]:
-    """Parse multi-line secret material from an upcall.
-
-    Shared by the `pass` and `command` backends, so the error names neither.
-    """
+    """Parse multi-line secret material from a `pass` entry."""
     stripped = text.lstrip()
     if "=" in stripped:
         try:
@@ -5144,6 +4852,17 @@ def optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def verbatim_str_tuple(value: Any) -> tuple[str, ...]:
+    """Like optional_str_tuple, but keeping every entry exactly as written.
+
+    Directives and notes are free text: surrounding whitespace and blank
+    entries are the author's, so nothing is stripped or dropped.
+    """
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
 
 
 def optional_str_tuple(value: Any) -> tuple[str, ...]:
@@ -5291,6 +5010,55 @@ def ensure_job_id_pattern(profile: ProfileRecord) -> None:
         )
 
 
+def run_submit_command(
+    secret: "FleetSecret",
+    profile: "ProfileRecord",
+    *,
+    remote_script: str,
+    cwd: str | None,
+    ssh_runtime: dict[str, Any],
+    attempt: "Attempt | None" = None,
+    **capture: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run PROFILE's `submit_command` on the already-staged REMOTE_SCRIPT.
+
+    ATTEMPT (the `--json` path) is told the primary command is going out;
+    CAPTURE passes `stdout_limit`/`stderr_limit` through.
+    """
+    submit_argv = render_template_values(
+        profile.submit_command,
+        script_path=remote_script,
+        workdir=cwd,
+    )
+    if not submit_argv:  # unreachable: check_protocol_profile ran at resolve time
+        raise FleetError(f"profile {profile.name!r} does not define `submit_command`")
+    if attempt is not None:
+        attempt.sent = True
+    return run_ssh_command(
+        secret,
+        allocate_tty=False,
+        remote_command=remote_shell_command(submit_argv, cwd=cwd),
+        capture_output=True,
+        timeout=SUBMIT_COMMAND_TIMEOUT,
+        **capture,
+        **ssh_runtime,
+    )
+
+
+def parse_submitted_job_id(profile: "ProfileRecord", stdout: str | None) -> str | None:
+    """Pull the scheduler's job id out of STDOUT, or None when it cannot be read."""
+    match = (
+        re.search(profile.job_id_pattern, stdout or "")
+        if profile.job_id_pattern
+        else None
+    )
+    if match is None:
+        return None
+    return match.groupdict().get("job_id") or (
+        match.group(1) if match.groups() else match.group(0)
+    )
+
+
 def submit_staged_script(
     secret: "FleetSecret",
     profile: "ProfileRecord",
@@ -5303,20 +5071,8 @@ def submit_staged_script(
     ledger: tuple[FleetPaths, dict[str, Any]] | None = None,
 ) -> int:
     """Hand one already-staged script to the profile's scheduler."""
-    submit_argv = render_template_values(
-        profile.submit_command,
-        script_path=remote_script,
-        workdir=cwd,
-    )
-    if not submit_argv:  # unreachable: check_protocol_profile ran at resolve time
-        raise FleetError(f"profile {profile.name!r} does not define `submit_command`")
-    completed = run_ssh_command(
-        secret,
-        allocate_tty=False,
-        remote_command=remote_shell_command(submit_argv, cwd=cwd),
-        capture_output=True,
-        timeout=SUBMIT_COMMAND_TIMEOUT,
-        **ssh_runtime,
+    completed = run_submit_command(
+        secret, profile, remote_script=remote_script, cwd=cwd, ssh_runtime=ssh_runtime
     )
     return report_submitted_job(
         completed,
@@ -5356,12 +5112,8 @@ def report_submitted_job(
     if completed.returncode != 0:
         return completed.returncode
 
-    match = (
-        re.search(profile.job_id_pattern, completed.stdout)
-        if profile.job_id_pattern
-        else None
-    )
-    if match is None:
+    job_id = parse_submitted_job_id(profile, completed.stdout)
+    if job_id is None:
         print(
             "warning: the scheduler accepted the script but its job id could not be "
             f"parsed (job_id_pattern={profile.job_id_pattern!r}). The job IS most "
@@ -5371,9 +5123,6 @@ def report_submitted_job(
         )
         return completed.returncode
 
-    job_id = match.groupdict().get("job_id")
-    if not job_id:
-        job_id = match.group(1) if match.groups() else match.group(0)
     print(f"job_id={job_id}")
     resolved_out = output_path.replace("%j", job_id) if output_path else ""
     resolved_err = error_path.replace("%j", job_id) if error_path else ""
@@ -5719,8 +5468,8 @@ def _lock_path_for(path: Path) -> Path:
 def flock_guard(path: Path):
     """Hold an exclusive fcntl lock across one read-modify-write cycle on PATH.
 
-    Every reader/writer of shared, concurrently-touched state (routes.json,
-    the control-budget bucket, the audit/ledger trim) wraps its whole
+    Every reader/writer of shared, concurrently-touched state (the
+    audit/ledger trim) wraps its whole
     read-then-decide-then-write in this, so two fleetctl processes racing each
     other never interleave into a lost update.  See `_lock_path_for` for why
     the lock lives on a sibling file rather than on PATH itself.
@@ -5736,29 +5485,6 @@ def flock_guard(path: Path):
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
-
-
-def write_json_atomic(
-    path: Path, data: Any, *, mode: int, indent: int | None = None
-) -> None:
-    """Write DATA as JSON to PATH via tmp file + fsync + atomic rename.
-
-    Callers that need the read-modify-write itself to be race-free (not just
-    this one write) wrap the whole cycle in `flock_guard(path)`; this function
-    only makes the write half of it atomic and durable, which is what the
-    control budget's "tmp + fsync + rename" requirement asks for and a strict
-    improvement to reuse for routes.json too.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, delete=False
-    ) as handle:
-        json.dump(data, handle, sort_keys=True, indent=indent)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temp_path = Path(handle.name)
-    os.chmod(temp_path, mode)
-    temp_path.replace(path)
 
 
 def carry_secret_files(source_dir: Path, dest_dir: Path) -> list[str]:
@@ -5796,24 +5522,6 @@ def swap_config_tree(staging: Path, live: Path) -> Path | None:
         raise
     return previous if rotated else None
 
-SECRET_COMMAND_TIMEOUT = 30.0
-
-# How long one resolved upcall is reused.  ClusterShell caches its external group
-# sources too, but for an hour by default; this is far shorter because what is
-# cached is the address of a machine that moves, and a stale address is a
-# connection to whoever holds that address now.  It only has to cover the window
-# where two resolutions of one target must agree -- `sync push` and the `submit`
-# after it -- and it is deliberately not long enough to survive a coffee break.
-SECRET_COMMAND_TTL = 30.0
-
-# In-process only, and deliberately not a file under the state home.  A disk
-# cache of resolved secret material would be a second secret store with none of
-# the handling the first one gets, and the window that needs covering is one
-# command, not one week.  Locked because a fan-out resolves several targets at
-# once and they may share an upcall.
-_SECRET_COMMAND_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_SECRET_COMMAND_LOCK = threading.Lock()
-
 
 def run_upcall(
     argv: list[str],
@@ -5843,55 +5551,6 @@ def run_upcall(
             _kill_process_group(process)
             raise
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
-
-
-def run_secret_command(command: str, *, what: str) -> dict[str, Any]:
-    """Run one secret upcall and parse its output, cached for the TTL.
-
-    The whole point is to resolve a churning cloud address at connect time
-    without teaching fleetctl a cloud API: the command knows, fleetctl asks.
-
-    Its stdout is a secret, which is why the failure path reports stderr and
-    never stdout.  `run_pass_show` can fall back to printing stdout because
-    `pass` writes diagnostics there when it fails; an upcall that exits non-zero
-    has already put the first half of a credential there instead.  A failure is a
-    FleetError naming the command that failed -- never a partial secret handed on
-    to the connection layer, which would resolve to a target nobody chose.
-    """
-    argv = shlex.split(command)
-    if not argv:
-        raise FleetError(
-            f"`secret_ref` for {what} is empty, but the `command` backend reads "
-            "it as the command to run"
-        )
-    with _SECRET_COMMAND_LOCK:
-        cached = _SECRET_COMMAND_CACHE.get(command)
-        if cached is not None and cached[0] > time.monotonic():
-            return dict(cached[1])
-    try:
-        completed = run_upcall(argv, timeout=SECRET_COMMAND_TIMEOUT)
-    except FileNotFoundError as exc:
-        raise FleetError(
-            f"secret command for {what} cannot be run: {argv[0]!r} not found"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise FleetError(
-            f"secret command for {what} timed out after "
-            f"{SECRET_COMMAND_TIMEOUT:g}s: {shlex.join(argv)}"
-        ) from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or "").strip().splitlines()
-        raise FleetError(
-            f"secret command for {what} exited {completed.returncode}: "
-            + (detail[-1] if detail else "nothing on stderr to explain it")
-        )
-    values = parse_secret_blob(completed.stdout)
-    with _SECRET_COMMAND_LOCK:
-        _SECRET_COMMAND_CACHE[command] = (
-            time.monotonic() + SECRET_COMMAND_TTL,
-            dict(values),
-        )
-    return values
 
 
 def run_pass_show(secret_ref: str) -> str:
@@ -6261,25 +5920,19 @@ def build_ssh_command(
     *,
     allocate_tty: bool,
     remote_command: str | None,
-    known_hosts_file: str | None = None,
-    control_path: str | None = None,
-    strict_host_key_checking: str | None = None,
-    update_host_keys: bool = True,
-    proxy_command: str | None = None,
+    **runtime: Any,
 ) -> list[str]:
-    """Build one ssh command."""
+    """Build one ssh command.
+
+    RUNTIME is the route's ssh settings (`known_hosts_file`, `control_path`,
+    `strict_host_key_checking`, `update_host_keys`, `proxy_command`), passed
+    straight to ssh_option_parts.
+    """
     command = ssh_transport_prefix(secret) + ["ssh"]
     if allocate_tty:
         command.append("-t")
     command += ["-p", str(secret.port)]
-    command += ssh_option_parts(
-        secret,
-        known_hosts_file=known_hosts_file,
-        control_path=control_path,
-        strict_host_key_checking=strict_host_key_checking,
-        update_host_keys=update_host_keys,
-        proxy_command=proxy_command,
-    )
+    command += ssh_option_parts(secret, **runtime)
     command.append(secret.target)
     if remote_command is not None:
         command.append(remote_command)
@@ -6291,45 +5944,19 @@ def build_scp_command(
     *,
     source: str,
     dest: str,
-    known_hosts_file: str | None = None,
-    control_path: str | None = None,
-    strict_host_key_checking: str | None = None,
-    update_host_keys: bool = True,
-    proxy_command: str | None = None,
+    **runtime: Any,
 ) -> list[str]:
     """Build one scp command."""
     command = ssh_transport_prefix(secret) + ["scp", "-P", str(secret.port)]
-    command += ssh_option_parts(
-        secret,
-        known_hosts_file=known_hosts_file,
-        control_path=control_path,
-        strict_host_key_checking=strict_host_key_checking,
-        update_host_keys=update_host_keys,
-        proxy_command=proxy_command,
-    )
+    command += ssh_option_parts(secret, **runtime)
     command += [source, dest]
     return command
 
 
-def build_rsync_transport(
-    secret: FleetSecret,
-    *,
-    known_hosts_file: str | None = None,
-    control_path: str | None = None,
-    strict_host_key_checking: str | None = None,
-    update_host_keys: bool = True,
-    proxy_command: str | None = None,
-) -> str:
+def build_rsync_transport(secret: FleetSecret, **runtime: Any) -> str:
     """Build the SSH transport string for rsync."""
     parts = ssh_transport_prefix(secret) + ["ssh", "-p", str(secret.port)]
-    parts += ssh_option_parts(
-        secret,
-        known_hosts_file=known_hosts_file,
-        control_path=control_path,
-        strict_host_key_checking=strict_host_key_checking,
-        update_host_keys=update_host_keys,
-        proxy_command=proxy_command,
-    )
+    parts += ssh_option_parts(secret, **runtime)
     return shlex.join(parts)
 
 
@@ -6574,25 +6201,17 @@ def run_ssh_command(
     allocate_tty: bool,
     remote_command: str | None,
     capture_output: bool = False,
-    known_hosts_file: str | None = None,
-    control_path: str | None = None,
-    strict_host_key_checking: str | None = None,
-    update_host_keys: bool = True,
-    proxy_command: str | None = None,
     timeout: float | None = None,
     stdout_limit: int | None = None,
     stderr_limit: int | None = None,
+    **runtime: Any,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one ssh command with fleet defaults."""
+    """Run one ssh command with fleet defaults; RUNTIME is build_ssh_command's."""
     command = build_ssh_command(
         secret,
         allocate_tty=allocate_tty,
         remote_command=remote_command,
-        known_hosts_file=known_hosts_file,
-        control_path=control_path,
-        strict_host_key_checking=strict_host_key_checking,
-        update_host_keys=update_host_keys,
-        proxy_command=proxy_command,
+        **runtime,
     )
     return run_command(
         command,
@@ -6717,55 +6336,6 @@ def utc_timestamp() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
-
-
-def route_state_file(paths: FleetPaths) -> Path:
-    """Where the route each target was last reached over is recorded."""
-    return paths.state_home / "routes.json"
-
-
-def read_route_state(paths: FleetPaths) -> dict[str, Any]:
-    """Read the route each target was last reached over, for reporting only.
-
-    Never consulted when choosing a route.  A cache that remembered the bridge
-    had worked would quietly pin every later command to it, which is the exact
-    opposite of preferring the direct path.
-    """
-    try:
-        loaded = json.loads(route_state_file(paths).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
-def record_route_state(
-    paths: FleetPaths, target: str, route: str, control_path: str
-) -> None:
-    """Record the route TARGET was just reached over.
-
-    Bookkeeping never breaks a connection: a state directory that cannot be
-    written costs a line of reporting, not the command that was about to run.
-    The read, the merge and the write all happen inside one `flock_guard`, so
-    two fleetctl processes recording two different targets' routes at the same
-    moment cannot race each other into one process's update clobbering the
-    other's -- a plain read-then-write here (the old implementation) is
-    exactly that lost-update race, just rare enough to have never been
-    noticed.
-    """
-    try:
-        ensure_private_dir(paths.state_home, mode=STATE_DIR_MODE)
-        with flock_guard(route_state_file(paths)):
-            state = read_route_state(paths)
-            state[target] = {
-                "route": route,
-                "socket": control_path,
-                "at": utc_timestamp(),
-            }
-            write_json_atomic(
-                route_state_file(paths), state, mode=PRIVATE_FILE_MODE, indent=2
-            )
-    except OSError:
-        pass
 
 
 def jobs_ledger_file(paths: FleetPaths) -> Path:
@@ -7038,61 +6608,17 @@ def record_invocation(
 # ---- SECTION: control budget (managed-cluster rate limiting) ---------------
 #
 # A managed cluster's `[control_budget]` (see ControlBudgetRecord, parsed in
-# load_protocols) is enforced in two independent layers, either or both of
-# which may apply:
+# load_protocols) is enforced by a central authority
+# (`authority_url`/`authority_token_file`) that can coordinate across every
+# caller.  It fails closed: unreachable, slow, or answering nonsense all deny.
+# A protocol that declares `[control_budget]` without an authority is a config
+# error at load time, never an unbudgeted cluster.
 #
-#   * a local interim token bucket, entirely on this machine, persisted at
-#     $FLEET_STATE_HOME/budget/<canonical_cluster>.json.  It is a per-machine
-#     safeguard only -- N fleetctl processes on N different laptops each get
-#     their own bucket -- which is why its outcome is always tagged
-#     `budget_scope = "local"` rather than implying a fleet-wide guarantee.
-#   * a central authority (`authority_url`/`authority_token_file`), consulted
-#     first when configured, that can actually coordinate across every caller.
-#     It fails closed: unreachable, slow, or answering nonsense all deny.
-#
-# Both raise BudgetRefused on denial, which every verb's caller lets surface as
-# an ordinary FleetError (exit_code=75) or, under `--json`, the
-# `budget_refused` outcome -- no separate handling needed at either call site.
+# Denial raises BudgetRefused, which every verb's caller lets surface as an
+# ordinary FleetError (exit_code=75) or, under `--json`, the `budget_refused`
+# outcome -- no separate handling needed at either call site.
 
 AUTHORITY_TIMEOUT = 5.0
-
-
-def control_budget_state_file(paths: FleetPaths, canonical: str) -> Path:
-    """Where CANONICAL's local token-bucket state is persisted."""
-    return paths.state_home / "budget" / f"{canonical}.json"
-
-
-def load_control_budget_state(path: Path) -> dict[str, float]:
-    """Read one bucket's persisted token state, conservatively.
-
-    Missing, corrupt, or otherwise unreadable -> {"tokens": 0.0, "updated":
-    now}, never a full burst.  "A restart must not refill them to a full
-    burst" is read as: a bucket that cannot prove it has tokens saved up
-    starts as though it has none, and earns them back at the declared rate
-    like anything else -- an absent file must never look like "fully rested"
-    to whatever reads it, or deleting it would be a free burst.
-    """
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        tokens = float(loaded["tokens"])
-        updated = float(loaded["updated"])
-        if not math.isfinite(tokens) or tokens < 0 or not math.isfinite(updated):
-            raise ValueError("non-finite or negative bucket state")
-        return {"tokens": tokens, "updated": updated}
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"tokens": 0.0, "updated": time.time()}
-
-
-def _budget_rate(budget: ControlBudgetRecord, op_class: str) -> float | None:
-    """Tokens per second for OP_CLASS, or None when the site set no limit for it."""
-    per_minute = {
-        "monitor": budget.monitor_per_minute,
-        "action": budget.action_per_minute,
-        "transfer": budget.transfer_per_minute,
-    }.get(op_class)
-    if per_minute is None:
-        return None
-    return per_minute / 60.0
 
 
 def local_sync_source_bytes(value: str) -> int:
@@ -7153,12 +6679,7 @@ def sync_budget_bytes(args: argparse.Namespace) -> int:
 
 def central_sync_budget_bytes(args: argparse.Namespace, *plans: "Plan") -> int | None:
     """Compute one ceiling when any participating endpoint uses central authority."""
-    if any(
-        plan.protocol.control_budget is not None
-        and plan.protocol.control_budget.authority_url
-        and plan.protocol.control_budget.authority_token_file
-        for plan in plans
-    ):
+    if any(plan.protocol.control_budget is not None for plan in plans):
         return sync_budget_bytes(args)
     return None
 
@@ -7172,57 +6693,6 @@ def verify_sync_source_within_budget(args: argparse.Namespace, allowance: int) -
                 f"local sync source grew to {measured} bytes, above its "
                 f"{allowance}-byte budget ceiling"
             )
-
-
-def acquire_local_budget(
-    paths: FleetPaths,
-    budget: ControlBudgetRecord,
-    op_class: str,
-    *,
-    wait: float = 0.0,
-) -> dict[str, Any]:
-    """Spend one token from BUDGET's OP_CLASS bucket, or raise BudgetRefused.
-
-    The read, refill, grant-or-deny decision and write are one `flock_guard`
-    per attempt, so two processes charging the same bucket at once cannot both
-    read the same starting balance and both believe they spent the last token.
-    WAIT, when given, retries -- sleeping the estimated retry_after each time,
-    bounded by what is left of WAIT -- rather than busy-spinning inside the
-    lock, which would starve every other process sharing the bucket.  A wall-
-    clock step backwards mints no tokens: elapsed time since the last write is
-    clamped to zero rather than allowed to go negative.
-    """
-    rate = _budget_rate(budget, op_class)
-    path = control_budget_state_file(paths, budget.canonical_cluster)
-    burst = budget.burst if budget.burst is not None else 1.0
-    deadline = time.monotonic() + max(wait, 0.0)
-    while True:
-        with flock_guard(path):
-            state = load_control_budget_state(path)
-            now = time.time()
-            elapsed = max(0.0, now - state["updated"])
-            tokens = state["tokens"]
-            if rate is not None:
-                tokens = min(burst, tokens + elapsed * rate)
-            if rate is None or tokens >= 1.0:
-                spent = tokens - 1.0 if rate is not None else tokens
-                write_json_atomic(
-                    path, {"tokens": max(spent, 0.0), "updated": now}, mode=PRIVATE_FILE_MODE
-                )
-                return {"budget_scope": "local"}
-            retry_after = (1.0 - tokens) / rate
-            write_json_atomic(
-                path, {"tokens": tokens, "updated": now}, mode=PRIVATE_FILE_MODE
-            )
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or retry_after > remaining:
-            raise BudgetRefused(
-                f"control budget exhausted for {budget.canonical_cluster!r} "
-                f"({op_class}); retry in {retry_after:.1f}s",
-                scope="local",
-                retry_after=retry_after,
-            )
-        time.sleep(min(retry_after, remaining))
 
 
 def resolve_op_class(verb: str, args: argparse.Namespace) -> str:
@@ -7366,12 +6836,11 @@ def enforce_control_budget(
     A no-op ({}) when the protocol declares no `[control_budget]`.  Otherwise,
     before anything connects: if a co-resident scheduler already holds a
     permit (`FLEETCTL_PERMIT` in the environment), redeem it rather than
-    request a fresh one; else, when the site configures a central authority,
-    ask it; else fall back to the local interim bucket.  Raises BudgetRefused
-    on denial -- callers do not need to catch it specially, it is a FleetError
-    with exit_code=75, so it already prints and exits correctly through the
-    same path every other refusal does, and `--json` classifies it as
-    `budget_refused` the same way it classifies any other exception raised
+    request a fresh one; else ask the central authority for one.  Raises
+    BudgetRefused on denial -- callers do not need to catch it specially, it is
+    a FleetError with exit_code=75, so it already prints and exits correctly
+    through the same path every other refusal does, and `--json` classifies it
+    as `budget_refused` the same way it classifies any other exception raised
     before a connection is attempted.
     """
     budget = plan.protocol.control_budget
@@ -7386,44 +6855,41 @@ def enforce_control_budget(
             file=sys.stderr,
         )
     caller = bounded_caller_env() or "fleetctl"
-    if budget.authority_url and budget.authority_token_file:
-        cost = {
-            "rpc": {"submit": 12, "job": 6, "exec": 8, "script": 8, "sync": 6}.get(verb, 4),
-            "sessions": session_cost
-            if session_cost is not None
-            else {"submit": 3, "job": 2, "exec": 2, "script": 2, "sync": 3}.get(verb, 2),
-            "bytes": (sync_budget_bytes(args) if byte_cost is None else byte_cost)
-            if verb == "sync"
-            else 0,
-        }
-        held_permit = os.environ.get("FLEETCTL_PERMIT")
-        if held_permit:
-            if not authority_redeem_permit(
-                budget.authority_url,
-                budget.authority_token_file,
-                held_permit,
-                cluster=budget.canonical_cluster,
-                op_class=op_class,
-                cost=cost,
-            ):
-                raise BudgetRefused(
-                    f"held permit {held_permit!r} was not valid for "
-                    f"{budget.canonical_cluster!r}",
-                    scope="central",
-                    reason="permit_invalid",
-                )
-            return {"budget_scope": "central", "permit_id": held_permit}
-        granted = authority_request_permit(
+    cost = {
+        "rpc": {"submit": 12, "job": 6, "exec": 8, "script": 8, "sync": 6}.get(verb, 4),
+        "sessions": session_cost
+        if session_cost is not None
+        else {"submit": 3, "job": 2, "exec": 2, "script": 2, "sync": 3}.get(verb, 2),
+        "bytes": (sync_budget_bytes(args) if byte_cost is None else byte_cost)
+        if verb == "sync"
+        else 0,
+    }
+    held_permit = os.environ.get("FLEETCTL_PERMIT")
+    if held_permit:
+        if not authority_redeem_permit(
             budget.authority_url,
             budget.authority_token_file,
+            held_permit,
             cluster=budget.canonical_cluster,
             op_class=op_class,
-            caller=caller,
             cost=cost,
-        )
-        return {"budget_scope": "central", "permit_id": granted.get("permit_id")}
-    wait = float(getattr(args, "budget_wait", None) or 0.0)
-    return acquire_local_budget(plan.context.paths, budget, op_class, wait=wait)
+        ):
+            raise BudgetRefused(
+                f"held permit {held_permit!r} was not valid for "
+                f"{budget.canonical_cluster!r}",
+                scope="central",
+                reason="permit_invalid",
+            )
+        return {"budget_scope": "central", "permit_id": held_permit}
+    granted = authority_request_permit(
+        budget.authority_url,
+        budget.authority_token_file,
+        cluster=budget.canonical_cluster,
+        op_class=op_class,
+        caller=caller,
+        cost=cost,
+    )
+    return {"budget_scope": "central", "permit_id": granted.get("permit_id")}
 
 
 def bring_up_control_master(
@@ -7532,9 +6998,6 @@ def establish_route(
             continue
         if failure is None:
             context.route_established[target.name] = route
-            record_route_state(
-                context.paths, target.name, route, str(runtime["control_path"])
-            )
             return route, failures
         failures.append(f"{route} ({failure})")
     return None, failures
@@ -8460,11 +7923,6 @@ def report_script_plan(
     """Describe the script run PLAN would perform."""
     chosen = interpreter or plan.profile.interpreter
     staged = planned_script_path(plan.profile, local_script)
-    argv: list[str] = []
-    if chosen:
-        argv.extend(shlex.split(chosen))
-    argv.append(staged)
-    argv.extend(script_args)
     return report_plan(
         plan,
         args,
@@ -8473,7 +7931,9 @@ def report_script_plan(
             "staged_as": staged,
             "interpreter": chosen,
             "remote_command": shlex.join(
-                prefixed_env_command(argv, plan.profile.environment)
+                script_remote_argv(
+                    plan, staged, interpreter=interpreter, script_args=script_args
+                )
             ),
         },
     )
@@ -9465,9 +8925,7 @@ def preflight_gate(
         with tempfile.TemporaryDirectory(prefix="fleetctl-preflight-") as scratch:
             rendered = Path(scratch) / f"{local_script.stem}.wrapper.sbatch"
             rendered.write_text(wrapper.text, encoding="utf-8")
-            report = preflight_script(
-                rendered, protocol=plan.protocol, strict=strict, check_paths=False
-            )
+            report = preflight_script(rendered, protocol=plan.protocol, strict=strict)
         label = f"{local_script.name} as wrapped for queue {plan.queue.name!r}"
     print(render_preflight_text(report, label, strict=strict), file=sys.stderr)
     if report.worst_level() == LEVEL_ERROR:
@@ -9619,7 +9077,6 @@ def command_seed_pass(args: argparse.Namespace, context: FleetContext) -> int:
             target,
             secret_backend="pass",
             secret_ref=secret_entry,
-            secret_inline={},
         )
         target_entry = pass_entry_name(prefix, "targets", target.name)
         run_pass_insert(target_entry, target_to_toml(rendered_target), force=args.force)
@@ -9630,418 +9087,12 @@ def command_seed_pass(args: argparse.Namespace, context: FleetContext) -> int:
     return 0
 
 
-def pool_to_toml(pool: PoolRecord) -> str:
-    """Serialize a pool file."""
-    lines = [
-        "version = 1",
-        f"name = {toml_string(pool.name)}",
-    ]
-    if pool.targets:
-        members = ", ".join(toml_string(name) for name in pool.targets)
-        lines.append(f"targets = [{members}]")
-    if pool.match_tags:
-        tags = ", ".join(toml_string(tag) for tag in pool.match_tags)
-        lines.append(f"match_tags = [{tags}]")
-    return "\n".join(lines) + "\n"
-
-
-def strip_top_level_keys(text: str, keys: Iterable[str]) -> tuple[str, list[str]]:
-    """Delete top-level `key = value` lines, leaving every other byte alone.
-
-    Protocol files carry `[[queue]]` tables and hand-written comments, and there
-    is no round-trip serializer for them, so a rewrite would lose both.  Only
-    lines above the first table header are considered: that is where TOML puts
-    top-level keys, and a `kind` inside `[[queue]]` is a different key that must
-    survive.  Callers pass only scalar keys, so no value can span lines.
-    """
-    wanted = set(keys)
-    kept: list[str] = []
-    removed: list[str] = []
-    reached_tables = False
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("["):
-            reached_tables = True
-        if not reached_tables and "=" in stripped and not stripped.startswith("#"):
-            key = stripped.split("=", 1)[0].strip().strip("\"'")
-            if key in wanted:
-                removed.append(key)
-                continue
-        kept.append(line)
-    return "".join(kept), removed
-
-
-def strip_toml_table(text: str, name: str) -> tuple[str, bool]:
-    """Remove one whole top-level `[name]` table from a TOML document."""
-    kept: list[str] = []
-    inside = False
-    removed = False
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("["):
-            inside = stripped in (f"[{name}]", f'["{name}"]', f"['{name}']")
-            removed = removed or inside
-        if inside:
-            continue
-        kept.append(line)
-    return "".join(kept), removed
-
-
-def bridge_dependents(context: FleetContext) -> tuple[dict[str, list[str]], list[str]]:
-    """Map each target that is another target's SSH waypoint to who needs it.
-
-    Migration only.  The evidence is the deprecated `proxy_jump`, which no longer
-    survives parsing, so this reads the raw secret material -- and it reads values
-    that must never be printed, so only the conclusion comes back: "<the bridge>
-    is the waypoint for <the dependent>", never the host it resolved through.
-    """
-    raws: dict[str, dict[str, Any]] = {}
-    notes: list[str] = []
-    for target in context.targets.values():
-        try:
-            raws[target.name], _ = context.resolve_secret_raw(target)
-        except FleetError:
-            notes.append(
-                f"could not read {target.name!r}'s secret, so it was neither "
-                "classified as a waypoint nor checked for one"
-            )
-    by_host = {
-        str(raw["host"]).lower(): name
-        for name, raw in raws.items()
-        if optional_str(raw.get("host"))
-    }
-    dependents: dict[str, list[str]] = {}
-    for name, raw in raws.items():
-        declared = optional_str(raw.get("proxy_jump"))
-        if not declared:
-            continue
-        hop = declared.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
-        owner = by_host.get(hop) or (hop if hop in context.targets else None)
-        if owner is None:
-            notes.append(
-                f"{name!r} is reached through a waypoint that is not itself a fleet "
-                "target, so fleetctl cannot validate or reuse that hop; import it "
-                "with `fleetctl import-ssh --role bridge`"
-            )
-            continue
-        dependents.setdefault(owner, []).append(name)
-    return {name: sorted(users) for name, users in dependents.items()}, notes
-
-
 def parse_assignment(raw: str, *, flag: str) -> tuple[str, str]:
     """Parse a `NAME=VALUE` command-line assignment."""
     name, separator, value = raw.partition("=")
     if not separator or not name.strip() or not value.strip():
         raise FleetError(f"`{flag}` expects NAME=VALUE, got {raw!r}")
     return name.strip(), value.strip()
-
-
-def command_migrate_config(args: argparse.Namespace) -> int:
-    """Write today's schema into the live fleet config, once.
-
-    Idempotent: a second run finds every role declared and every dead key gone,
-    and changes nothing.  The new tree is rendered and validated in a sibling
-    staging directory and swapped in by rename, so a migration that would produce
-    an unloadable config leaves the working one untouched.
-    """
-    live = build_paths(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    # Non-strict: this is the tool you reach for *because* the config is stale.
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-        strict=False,
-    )
-    if not context.targets:
-        raise FleetError(f"no targets found under {live.targets_dir}")
-
-    overrides: dict[str, str] = {}
-    for raw in args.role:
-        name, role = parse_assignment(raw, flag="--role")
-        if name not in context.targets:
-            raise FleetError(f"--role names unknown target {name!r}; run `fleetctl list`")
-        if role not in ROLES:
-            raise FleetError(
-                f"--role {name}={role}: {role!r} is not one of {', '.join(ROLES)}"
-            )
-        overrides[name] = role
-
-    renames: dict[str, str] = {}
-    for raw in args.rename:
-        old, new = parse_assignment(raw, flag="--rename")
-        if old not in context.targets:
-            raise FleetError(f"--rename names unknown target {old!r}; run `fleetctl list`")
-        if new in context.targets:
-            raise FleetError(f"--rename target {new!r} already exists")
-        if new != Path(new).name or new.startswith("."):
-            raise FleetError(f"--rename target {new!r} is not a usable file name")
-        renames[old] = new
-
-    dependents, notes = bridge_dependents(context)
-    # The inverse of `dependents`, so each hop can be lifted out of the secret and
-    # into the target that uses it.  Direct comes first: a bridge is the fallback,
-    # never the default path.
-    lifted_reach = {
-        user: (ROUTE_DIRECT, f"{ROUTE_VIA_PREFIX}{renames.get(owner, owner)}")
-        for owner, users in dependents.items()
-        for user in users
-    }
-
-    # --- decide, and be able to say why ------------------------------------
-    decisions: list[tuple[str, str, str, str]] = []  # name, new name, role, reason
-    blockers: list[str] = []
-    for name in sorted(context.targets):
-        target = context.targets[name]
-        try:
-            protocol = context.protocol_for(target)
-        except FleetError as exc:
-            blockers.append(f"{name}: {exc}")
-            continue
-        if name in overrides:
-            role, why = overrides[name], "you named it on the command line"
-        elif target.role:
-            role, why = target.role, "already declared"
-        elif name in dependents:
-            role = "bridge"
-            why = "it is the SSH waypoint for " + ", ".join(dependents[name])
-        else:
-            role = resolve_role(target, protocol)
-            why = (
-                f"protocol {protocol.name!r} is scheduler-backed"
-                if role == "login"
-                else f"protocol {protocol.name!r} runs work directly"
-            )
-        # target_to_toml() cannot express this, so a rewrite would drop it.
-        if target.secret_inline:
-            blockers.append(
-                f"{name}: keeps its connection details in an inline `[secret]` table, "
-                "which this rewrite would drop; move it to a secret file first"
-            )
-        decisions.append((name, renames.get(name, name), role, why))
-
-    if blockers:
-        raise FleetError(
-            "cannot migrate this config:\n  - " + "\n  - ".join(blockers)
-        )
-
-    staging_root = live.config_home.with_name(live.config_home.name + ".new")
-    if staging_root.exists():
-        shutil.rmtree(staging_root)
-    paths = build_paths(
-        config_home=staging_root,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    changes: list[str] = []
-    previous: Path | None = None
-    try:
-        shutil.copytree(live.config_home, staging_root, symlinks=True)
-
-        # The loader keys targets on the declared `name`, not the file name, so
-        # find each record's real file rather than assuming they agree.
-        sources: dict[str, Path] = {}
-        for entry in sorted(paths.targets_dir.glob("*.toml")):
-            try:
-                raw = tomllib.loads(entry.read_text(encoding="utf-8"))
-            except (OSError, tomllib.TOMLDecodeError):
-                continue
-            sources[str(raw.get("name") or entry.stem)] = entry
-
-        # --- targets: explicit role, no dead keys, new name if asked --------
-        for old_name, new_name, role, _why in decisions:
-            target = context.targets[old_name]
-            source = sources.get(old_name)
-            secret_ref = target.secret_ref
-            if old_name != new_name and target.secret_backend == "file" and secret_ref:
-                stem = f"{old_name}.toml"
-                fleet_owned = (
-                    expand_local_path(secret_ref) == live.secrets_dir / stem
-                    and secret_ref.endswith(stem)
-                )
-                if fleet_owned:
-                    staged_old = paths.secrets_dir / stem
-                    if staged_old.exists():
-                        os.replace(staged_old, paths.secrets_dir / f"{new_name}.toml")
-                    # Rewrite only the last component, so `~/.config/fleet/...`
-                    # keeps the spelling the operator chose.
-                    secret_ref = secret_ref[: -len(stem)] + f"{new_name}.toml"
-                    changes.append(f"secrets/{stem} -> secrets/{new_name}.toml")
-                else:
-                    notes.append(
-                        f"{new_name!r} keeps pointing at {stem} because its secret_ref "
-                        "is not a plain path into the fleet secrets directory"
-                    )
-            # Targets are re-serialized whole, so a dead key disappears without
-            # being asked to -- but only if something puts the migration on the
-            # change list, which is what decides whether the swap happens at all.
-            original = source.read_text(encoding="utf-8") if source else ""
-            _, dead = strip_top_level_keys(original, DEPRECATED_TARGET_KEYS)
-            if strip_toml_table(original, "metadata")[1]:
-                dead = [*dead, "metadata"]
-            for key in dead:
-                changes.append(f"targets.d/{new_name}.toml: dropped `{key}`")
-            comments = sum(1 for line in original.splitlines() if line.strip().startswith("#"))
-            if comments:
-                notes.append(
-                    f"{new_name!r} loses {comments} comment line(s): fleetctl rewrites "
-                    "target files from the record, and the previous config is kept "
-                    "one generation in `.prev`"
-                )
-
-            reach = target.reach
-            if reach == DEFAULT_REACH and old_name in lifted_reach:
-                reach = lifted_reach[old_name]
-                changes.append(
-                    f"targets.d/{new_name}.toml: reach = [{format_reach(reach)}] "
-                    "(lifted out of the secret's `proxy_jump`)"
-                )
-            replacement = replace(
-                target,
-                name=new_name,
-                role=role,
-                secret_ref=secret_ref,
-                reach=reach,
-            )
-            destination = paths.targets_dir / f"{new_name}.toml"
-            if source is not None and source != destination:
-                source.unlink()
-                changes.append(f"targets.d/{source.name} -> targets.d/{destination.name}")
-            write_text_file(
-                destination, target_to_toml(replacement), mode=PRIVATE_FILE_MODE
-            )
-            if role != target.role:
-                changes.append(f"targets.d/{new_name}.toml: role = {role!r} ({_why})")
-
-        # --- protocols and profiles: drop the keys nothing reads ------------
-        for directory, staged_dir, dead in (
-            (live.protocols_dir, paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
-            (live.profiles_dir, paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
-            # Secrets are edited in place rather than re-serialized: rewriting one
-            # from a parsed record would drop anything the schema does not model,
-            # and these are the files you cannot afford to lose.
-            (live.secrets_dir, paths.secrets_dir, DEPRECATED_SECRET_KEYS),
-        ):
-            if not staged_dir.exists():
-                continue
-            for entry in sorted(staged_dir.glob("*.toml")):
-                text = entry.read_text(encoding="utf-8")
-                stripped, removed = strip_top_level_keys(text, dead)
-                if not removed:
-                    continue
-                write_text_file(entry, stripped, mode=PRIVATE_FILE_MODE)
-                changes.append(
-                    f"{directory.name}/{entry.name}: dropped "
-                    + ", ".join(f"`{key}`" for key in removed)
-                )
-        # `[defaults]` held exactly one key and nothing ever read it.  Dropping
-        # the table rather than the key leaves no empty section behind.
-        if paths.config_file.exists():
-            text = paths.config_file.read_text(encoding="utf-8")
-            stripped, dropped = strip_toml_table(text, "defaults")
-            if dropped:
-                write_text_file(paths.config_file, stripped, mode=PRIVATE_FILE_MODE)
-                changes.append("config.toml: dropped `[defaults]`")
-        # --- follow the renames through everything that names a target -----
-        if renames:
-            for pool in context.pools.values():
-                if not any(name in renames for name in pool.targets):
-                    continue
-                updated = replace(
-                    pool,
-                    targets=tuple(renames.get(name, name) for name in pool.targets),
-                )
-                write_text_file(
-                    paths.pools_dir / f"{pool.name}.toml",
-                    pool_to_toml(updated),
-                    mode=PRIVATE_FILE_MODE,
-                )
-                changes.append(f"pools.d/{pool.name}.toml: renamed members")
-            touched_projects = False
-            rebuilt: list[ProjectBinding] = []
-            for binding in context.projects:
-                roots = {
-                    renames.get(name, name): root
-                    for name, root in binding.remote_roots_by_target.items()
-                }
-                default_target = renames.get(
-                    binding.default_target or "", binding.default_target
-                )
-                if (
-                    roots != binding.remote_roots_by_target
-                    or default_target != binding.default_target
-                ):
-                    touched_projects = True
-                rebuilt.append(
-                    replace(
-                        binding,
-                        default_target=default_target,
-                        remote_roots_by_target=roots,
-                    )
-                )
-            if touched_projects:
-                write_text_file(
-                    paths.projects_file,
-                    serialize_projects(rebuilt),
-                    mode=PRIVATE_FILE_MODE,
-                )
-                changes.append("projects.toml: renamed target references")
-
-        # --- validate before anything is swapped ---------------------------
-        try:
-            staged = FleetContext.load(
-                config_home=paths.config_home,
-                state_home=paths.state_home,
-                cache_home=paths.cache_home,
-            )
-        except FleetError as exc:
-            raise FleetError(
-                f"{exc}\n\nthis is a contradiction rather than a stale field, and "
-                "migrate-config will not guess which half you meant: correct the "
-                "protocol, or name the role with `--role NAME=ROLE`. Nothing has "
-                "been changed."
-            ) from exc
-        for target in staged.targets.values():
-            if target.secret_backend != "file" or not target.secret_ref:
-                continue
-            expected = expand_local_path(target.secret_ref)
-            try:
-                relative = expected.relative_to(live.secrets_dir)
-            except ValueError:
-                continue  # points outside the fleet tree; the operator owns it
-            if not (paths.secrets_dir / relative).exists():
-                raise FleetError(
-                    f"migrated target {target.name!r} would reference a secret file "
-                    f"that the new tree does not contain ({expected}); nothing has "
-                    "been changed"
-                )
-
-        for name, new_name, role, why in decisions:
-            label = name if name == new_name else f"{name} -> {new_name}"
-            print(f"{label}\trole={role}\t({why})")
-        for note in notes:
-            print(f"note: {note}", file=sys.stderr)
-
-        if not changes:
-            print("nothing to migrate: every role is declared and no dead keys remain")
-            return 0
-        for change in changes:
-            print(f"change: {change}")
-
-        if args.dry_run:
-            print("dry run: the live config was not touched", file=sys.stderr)
-            return 0
-        previous = swap_config_tree(staging_root, live.config_home)
-    finally:
-        if staging_root.exists():
-            shutil.rmtree(staging_root, ignore_errors=True)
-
-    if previous is not None:
-        print(f"note: previous config kept at {previous}", file=sys.stderr)
-    return 0
 
 
 def command_deploy_config(args: argparse.Namespace) -> int:
@@ -10438,6 +9489,64 @@ def emit_result_envelope(envelope: dict[str, Any]) -> None:
     print(json.dumps(envelope, indent=2, sort_keys=True))
 
 
+def emit_completed_envelope(
+    verb: str,
+    plan: "Plan",
+    completed: Any,
+    start: float,
+    details: dict[str, Any] | None = None,
+) -> int:
+    """Emit the envelope for a primary command that ran to COMPLETED; return its exit code."""
+    outcome, may_have_executed = classify_returncode(completed.returncode)
+    envelope = build_result_envelope(
+        verb=verb,
+        target=plan.target.name,
+        route=plan.route,
+        outcome=outcome,
+        may_have_executed=may_have_executed,
+        exit_code=completed.returncode,
+        remote_exit_code=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
+        stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
+        duration_s=time.monotonic() - start,
+        error=None,
+        details=details,
+    )
+    emit_result_envelope(envelope)
+    return envelope["exit_code"]
+
+
+def emit_dry_run_envelope(
+    verb: str, plan: "Plan", start: float, details: dict[str, Any]
+) -> int:
+    """Emit the envelope for a `--dry-run` that sent nothing; always exit 0."""
+    envelope = build_result_envelope(
+        verb=verb,
+        target=plan.target.name,
+        route=plan.route,
+        outcome="ok",
+        may_have_executed=False,
+        exit_code=0,
+        remote_exit_code=None,
+        stdout="",
+        stderr="",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        duration_s=time.monotonic() - start,
+        error=None,
+        details=details,
+    )
+    emit_result_envelope(envelope)
+    return 0
+
+
+def _capture_kwargs(capture: dict[str, int] | None) -> dict[str, Any]:
+    """run_ssh_command kwargs for CAPTURE: none to stream, else bounded capture."""
+    return {} if capture is None else {"capture_output": True, **capture}
+
+
 def _capture_limits(args: argparse.Namespace) -> tuple[int, int]:
     """Resolve the effective (stdout, stderr) capture caps from `--capture-limit`
     and `--stderr-capture-limit`.  Independent flags, independent defaults --
@@ -10493,89 +9602,13 @@ def _emit_json_failure(verb: str, attempt: Attempt, start: float, exc: Exception
     return envelope["exit_code"]
 
 
-def _json_exec(args: argparse.Namespace, context: FleetContext) -> int:
-    """The `--json` path for `exec`: same resolution as command_exec, an
-    fleetctl.result/v1 envelope instead of its normal output."""
-    start = time.monotonic()
-    attempt = Attempt()
-    try:
-        _reject_json_fanout(args)
-        argv = list(args.argv)
-        if args.selector_override and args.selector:
-            raise FleetError(
-                f"two targets named: {args.selector!r} positionally and "
-                f"{args.selector_override!r} via --target; the command goes after `--`"
-            )
-        args.selector = args.selector_override or args.selector
-        if not argv:
-            raise FleetError(
-                "`fleetctl exec` requires a command after `--`, as in "
-                "`fleetctl exec rtx1 -- nvidia-smi`"
-            )
-        plan = build_plan(context, args, "exec")
-        attempt.plan = plan
-        if args.dry_run:
-            envelope = build_result_envelope(
-                verb="exec",
-                target=plan.target.name,
-                route=plan.route,
-                outcome="ok",
-                may_have_executed=False,
-                exit_code=0,
-                remote_exit_code=None,
-                stdout="",
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-                duration_s=time.monotonic() - start,
-                error=None,
-                details={"dry_run": True, "remote_command": shlex.join(argv)},
-            )
-            emit_result_envelope(envelope)
-            return 0
-        enforce_control_budget(plan, args, "exec")
-        attempt.connecting = True
-        ssh_runtime = plan.connect()
-        stdout_limit, stderr_limit = _capture_limits(args)
-        attempt.sent = True
-        completed = run_ssh_command(
-            plan.secret,
-            allocate_tty=False,
-            remote_command=exec_remote_command(plan, argv),
-            capture_output=True,
-            stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit,
-            **ssh_runtime,
-        )
-        outcome, may_have_executed = classify_returncode(completed.returncode)
-        envelope = build_result_envelope(
-            verb="exec",
-            target=plan.target.name,
-            route=plan.route,
-            outcome=outcome,
-            may_have_executed=may_have_executed,
-            exit_code=completed.returncode,
-            remote_exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-            stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-            duration_s=time.monotonic() - start,
-            error=None,
-        )
-        emit_result_envelope(envelope)
-        return envelope["exit_code"]
-    except Exception as exc:  # noqa: BLE001 -- --json classifies any failure, see classify_exception
-        return _emit_json_failure("exec", attempt, start, exc)
+def resolve_exec_argv(args: argparse.Namespace) -> list[str]:
+    """Validate `exec`'s selector and command, set ARGS.selector, return the argv.
 
-
-def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
-    """Run one argv vector remotely without shell interpretation of the user payload."""
-    if getattr(args, "json", False):
-        return _json_exec(args, context)
-    # The positional is always a selector and the command always follows `--`.
-    # Guessing between the two meant `fleetctl exec htop` silently ran htop on
-    # whatever the current directory happened to be bound to.
+    The positional is always a selector and the command always follows `--`.
+    Guessing between the two meant `fleetctl exec htop` silently ran htop on
+    whatever the current directory happened to be bound to.
+    """
     argv = list(args.argv)
     if args.selector_override and args.selector:
         raise FleetError(
@@ -10588,6 +9621,72 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
             "`fleetctl exec` requires a command after `--`, as in "
             "`fleetctl exec rtx1 -- nvidia-smi`"
         )
+    return argv
+
+
+def run_exec(
+    plan: Plan,
+    argv: list[str],
+    *,
+    tty: bool = False,
+    attempt: Attempt | None = None,
+    capture: dict[str, int] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ARGV on PLAN's target.
+
+    The text path streams and may allocate a TTY (TTY).  A fan-out and `--json`
+    pass CAPTURE to capture output instead; `--json` also passes ATTEMPT so the
+    envelope can tell how far the run got.
+    """
+    if attempt is not None:
+        attempt.connecting = True
+    ssh_runtime = plan.connect()
+    if attempt is not None:
+        attempt.sent = True
+    return run_ssh_command(
+        plan.secret,
+        allocate_tty=tty,
+        remote_command=exec_remote_command(plan, argv),
+        **_capture_kwargs(capture),
+        **ssh_runtime,
+    )
+
+
+def _json_exec(args: argparse.Namespace, context: FleetContext) -> int:
+    """The `--json` path for `exec`: same resolution as command_exec, an
+    fleetctl.result/v1 envelope instead of its normal output."""
+    start = time.monotonic()
+    attempt = Attempt()
+    try:
+        _reject_json_fanout(args)
+        argv = resolve_exec_argv(args)
+        plan = build_plan(context, args, "exec")
+        attempt.plan = plan
+        if args.dry_run:
+            return emit_dry_run_envelope(
+                "exec",
+                plan,
+                start,
+                {"dry_run": True, "remote_command": shlex.join(argv)},
+            )
+        enforce_control_budget(plan, args, "exec")
+        stdout_limit, stderr_limit = _capture_limits(args)
+        completed = run_exec(
+            plan,
+            argv,
+            attempt=attempt,
+            capture={"stdout_limit": stdout_limit, "stderr_limit": stderr_limit},
+        )
+        return emit_completed_envelope("exec", plan, completed, start)
+    except Exception as exc:  # noqa: BLE001 -- --json classifies any failure, see classify_exception
+        return _emit_json_failure("exec", attempt, start, exc)
+
+
+def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
+    """Run one argv vector remotely without shell interpretation of the user payload."""
+    if getattr(args, "json", False):
+        return _json_exec(args, context)
+    argv = resolve_exec_argv(args)
     if fanout_requested(args):
         # No TTY across a fan-out, and none is offered: N pseudo-terminals
         # sharing one keyboard is not something to allocate by accident.
@@ -10606,13 +9705,7 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
             {"remote_command": shlex.join(argv), "environment": environment or None},
         )
     enforce_control_budget(plan, args, "exec")
-    completed = run_ssh_command(
-        plan.secret,
-        allocate_tty=bool(args.tty),
-        remote_command=exec_remote_command(plan, argv),
-        **plan.connect(),
-    )
-    return completed.returncode
+    return run_exec(plan, argv, tty=bool(args.tty)).returncode
 
 
 def exec_remote_command(plan: Plan, argv: list[str]) -> str:
@@ -10635,14 +9728,25 @@ def exec_remote_command(plan: Plan, argv: list[str]) -> str:
 def exec_one(plan: Plan, argv: list[str], args: argparse.Namespace) -> tuple[int, str, str]:
     """Run ARGV against PLAN and hand back what it printed, for a fan-out."""
     enforce_control_budget(plan, args, "exec")
-    completed = run_ssh_command(
-        plan.secret,
-        allocate_tty=False,
-        remote_command=exec_remote_command(plan, argv),
-        capture_output=True,
-        **plan.connect(),
-    )
+    completed = run_exec(plan, argv, capture={})
     return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def script_remote_argv(
+    plan: Plan,
+    script_path: str,
+    *,
+    interpreter: str | None,
+    script_args: list[str],
+) -> list[str]:
+    """The argv a `script` run executes remotely: interpreter, SCRIPT_PATH, args, env."""
+    argv: list[str] = []
+    chosen = interpreter or plan.profile.interpreter
+    if chosen:
+        argv.extend(shlex.split(chosen))
+    argv.append(script_path)
+    argv.extend(script_args)
+    return prefixed_env_command(argv, plan.profile.environment)
 
 
 def run_script_plan(
@@ -10651,10 +9755,20 @@ def run_script_plan(
     *,
     interpreter: str | None,
     script_args: list[str],
-    tty: bool,
-) -> int:
-    """Stage LOCAL_SCRIPT on PLAN's target and run it there."""
+    tty: bool = False,
+    attempt: Attempt | None = None,
+    capture: dict[str, int] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Stage LOCAL_SCRIPT on PLAN's target and run it there.
+
+    The text path streams (and may allocate a TTY).  The `--json` path passes
+    CAPTURE (`stdout_limit`/`stderr_limit`) to capture bounded output instead,
+    never allocates a TTY, and passes ATTEMPT so the envelope can tell how far
+    the run got.
+    """
     secret = plan.secret
+    if attempt is not None:
+        attempt.connecting = True
     ssh_runtime = plan.connect()
     remote_script = stage_remote_script(
         secret,
@@ -10662,55 +9776,16 @@ def run_script_plan(
         local_script,
         ssh_runtime=ssh_runtime,
     )
-    argv: list[str] = []
-    chosen = interpreter or plan.profile.interpreter
-    if chosen:
-        argv.extend(shlex.split(chosen))
-    argv.append(remote_script)
-    argv.extend(script_args)
-    argv = prefixed_env_command(argv, plan.profile.environment)
-    completed = run_ssh_command(
+    argv = script_remote_argv(
+        plan, remote_script, interpreter=interpreter, script_args=script_args
+    )
+    if attempt is not None:
+        attempt.sent = True
+    return run_ssh_command(
         secret,
         allocate_tty=tty,
         remote_command=remote_shell_command(argv, cwd=plan.cwd),
-        **ssh_runtime,
-    )
-    return completed.returncode
-
-
-def run_script_plan_json(
-    plan: Plan,
-    local_script: Path,
-    *,
-    interpreter: str | None,
-    script_args: list[str],
-    attempt: Attempt,
-    stdout_limit: int,
-    stderr_limit: int,
-) -> subprocess.CompletedProcess[str]:
-    """run_script_plan's logic, tracking ATTEMPT and capturing bounded output
-    instead of a TTY passthrough -- `--json` never allocates one."""
-    secret = plan.secret
-    attempt.connecting = True
-    ssh_runtime = plan.connect()
-    remote_script = stage_remote_script(
-        secret, plan.profile, local_script, ssh_runtime=ssh_runtime
-    )
-    argv: list[str] = []
-    chosen = interpreter or plan.profile.interpreter
-    if chosen:
-        argv.extend(shlex.split(chosen))
-    argv.append(remote_script)
-    argv.extend(script_args)
-    argv = prefixed_env_command(argv, plan.profile.environment)
-    attempt.sent = True
-    return run_ssh_command(
-        secret,
-        allocate_tty=False,
-        remote_command=remote_shell_command(argv, cwd=plan.cwd),
-        capture_output=True,
-        stdout_limit=stdout_limit,
-        stderr_limit=stderr_limit,
+        **_capture_kwargs(capture),
         **ssh_runtime,
     )
 
@@ -10727,66 +9802,35 @@ def _json_script(args: argparse.Namespace, context: FleetContext) -> int:
         plan = build_plan(context, args, "script")
         attempt.plan = plan
         if args.dry_run:
-            chosen = args.interpreter or plan.profile.interpreter
             staged = planned_script_path(plan.profile, local_script)
-            argv: list[str] = []
-            if chosen:
-                argv.extend(shlex.split(chosen))
-            argv.append(staged)
-            argv.extend(args.script_args)
-            envelope = build_result_envelope(
-                verb="script",
-                target=plan.target.name,
-                route=plan.route,
-                outcome="ok",
-                may_have_executed=False,
-                exit_code=0,
-                remote_exit_code=None,
-                stdout="",
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-                duration_s=time.monotonic() - start,
-                error=None,
-                details={
+            return emit_dry_run_envelope(
+                "script",
+                plan,
+                start,
+                {
                     "dry_run": True,
                     "staged_as": staged,
                     "remote_command": shlex.join(
-                        prefixed_env_command(argv, plan.profile.environment)
+                        script_remote_argv(
+                            plan,
+                            staged,
+                            interpreter=args.interpreter,
+                            script_args=args.script_args,
+                        )
                     ),
                 },
             )
-            emit_result_envelope(envelope)
-            return 0
         enforce_control_budget(plan, args, "script")
         stdout_limit, stderr_limit = _capture_limits(args)
-        completed = run_script_plan_json(
+        completed = run_script_plan(
             plan,
             local_script,
             interpreter=args.interpreter,
             script_args=args.script_args,
             attempt=attempt,
-            stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit,
+            capture={"stdout_limit": stdout_limit, "stderr_limit": stderr_limit},
         )
-        outcome, may_have_executed = classify_returncode(completed.returncode)
-        envelope = build_result_envelope(
-            verb="script",
-            target=plan.target.name,
-            route=plan.route,
-            outcome=outcome,
-            may_have_executed=may_have_executed,
-            exit_code=completed.returncode,
-            remote_exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-            stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-            duration_s=time.monotonic() - start,
-            error=None,
-        )
-        emit_result_envelope(envelope)
-        return envelope["exit_code"]
+        return emit_completed_envelope("script", plan, completed, start)
     except Exception as exc:  # noqa: BLE001
         return _emit_json_failure("script", attempt, start, exc)
 
@@ -10808,13 +9852,14 @@ def command_script(args: argparse.Namespace, context: FleetContext) -> int:
             script_args=args.script_args,
         )
     enforce_control_budget(plan, args, "script")
-    return run_script_plan(
+    completed = run_script_plan(
         plan,
         local_script,
         interpreter=args.interpreter,
         script_args=args.script_args,
         tty=bool(args.tty),
     )
+    return completed.returncode
 
 
 def _json_sync_transfer(
@@ -10832,112 +9877,33 @@ def _json_sync_transfer(
     both.  Peer-vs-relay fallback is an internal detail: the envelope reports
     whichever leg actually ran, in `details.relay`.
     """
-    if getattr(args, "expected_role", None):
-        raise FleetError("--expected-role is not supported with `sync transfer`.")
-    if args.selector:
-        raise FleetError(
-            "`sync transfer` names both endpoints positionally as "
-            "<target>[:<path>]; --target names one"
-        )
-    if not args.remote_path:
-        raise FleetError(
-            "`sync transfer` takes two endpoints: <source-target>[:<path>] "
-            "<destination-target>[:<path>]"
-        )
-    source_name, source_raw = parse_transfer_endpoint(args.local_path, what="source")
-    dest_name, dest_raw = parse_transfer_endpoint(args.remote_path, what="destination")
-    source_plan = transfer_endpoint_plan(context, args, source_name)
-    args.selector = dest_name
-    dest_plan = build_plan(context, args, "sync")
-    attempt.plan = dest_plan
-    if source_plan.target.name == dest_plan.target.name:
-        raise FleetError(
-            "source and destination both resolve to "
-            f"{dest_plan.target.name!r}; a transfer needs two different targets"
-        )
-    source_path = resolve_transfer_path(source_plan, source_raw, what="source")
-    dest_path = resolve_transfer_path(dest_plan, dest_raw, what="destination")
-    if args.delete:
-        ensure_sync_delete_allowed(
-            dest_path, dest_plan.target, direction="push", force=bool(args.force)
-        )
-    binding = dest_plan.binding or source_plan.binding
-    excludes = list(DEFAULT_SYNC_EXCLUDES)
-    if binding is not None:
-        excludes.extend(binding.sync_excludes)
+    source_plan, dest_plan, source_path, dest_path, excludes = prepare_sync_transfer(
+        args, context, attempt=attempt
+    )
     if args.dry_run:
-        envelope = build_result_envelope(
-            verb="sync",
-            target=dest_plan.target.name,
-            route=dest_plan.route,
-            outcome="ok",
-            may_have_executed=False,
-            exit_code=0,
-            remote_exit_code=None,
-            stdout="",
-            stderr="",
-            stdout_truncated=False,
-            stderr_truncated=False,
-            duration_s=time.monotonic() - start,
-            error=None,
-            details={
+        return emit_dry_run_envelope(
+            "sync",
+            dest_plan,
+            start,
+            {
                 "dry_run": True,
                 "direction": "transfer",
                 "source": source_plan.target.name,
                 "dest": dest_plan.target.name,
             },
         )
-        emit_result_envelope(envelope)
-        return 0
-    byte_cost = central_sync_budget_bytes(args, source_plan, dest_plan)
-    enforce_control_budget(
-        source_plan, args, "sync", byte_cost=byte_cost, session_cost=4
-    )
-    enforce_control_budget(
-        dest_plan, args, "sync", byte_cost=byte_cost, session_cost=3
-    )
+    enforce_transfer_budget(source_plan, dest_plan, args)
     attempt.connecting = True
-    used_relay = bool(args.relay)
     attempt.sent = True
-    if not args.relay:
-        try:
-            code = run_peer_transfer(
-                source_plan,
-                dest_plan,
-                source_path,
-                dest_path,
-                level=level,
-                delete=bool(args.delete),
-                force=bool(args.force),
-                excludes=excludes,
-            )
-        except FleetError as error:
-            # As in command_sync_transfer: a peer rsync that may have changed
-            # the destination stops rather than repeating through the relay.
-            if isinstance(error, PeerTransferUncertain) or args.no_fallback:
-                raise
-            used_relay = True
-            code = run_relay_transfer(
-                source_plan,
-                dest_plan,
-                source_path,
-                dest_path,
-                level=level,
-                delete=bool(args.delete),
-                force=bool(args.force),
-                excludes=excludes,
-            )
-    else:
-        code = run_relay_transfer(
-            source_plan,
-            dest_plan,
-            source_path,
-            dest_path,
-            level=level,
-            delete=bool(args.delete),
-            force=bool(args.force),
-            excludes=excludes,
-        )
+    code, used_relay = run_transfer_legs(
+        source_plan,
+        dest_plan,
+        source_path,
+        dest_path,
+        args,
+        level=level,
+        excludes=excludes,
+    )
     outcome, may_have_executed = classify_returncode(code)
     envelope = build_result_envelope(
         verb="sync",
@@ -10964,150 +9930,31 @@ def _json_sync_transfer(
     return envelope["exit_code"]
 
 
-def _json_sync(args: argparse.Namespace, context: FleetContext) -> int:
-    """The `--json` path for `sync push`/`sync pull`/`sync transfer`."""
-    start = time.monotonic()
-    attempt = Attempt()
-    try:
-        _reject_json_fanout(args)
-        level = args.compress_level
-        if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
-            raise FleetError(
-                f"--compress-level must be 0-{MAX_SYNC_COMPRESS_LEVEL}, got {level}."
-            )
-        if args.direction == "transfer":
-            return _json_sync_transfer(
-                args, context, level=level, start=start, attempt=attempt
-            )
-        plan = build_plan(context, args, "sync")
-        attempt.plan = plan
-        target = plan.target
-        secret = plan.secret
-        byte_cost = central_sync_budget_bytes(args, plan)
-        enforce_control_budget(plan, args, "sync", byte_cost=byte_cost)
-        default_remote = (
-            resolve_remote_path(args.remote_path, base=plan.cwd)
-            if args.remote_path
-            else plan.cwd
-        )
-        if not default_remote:
-            raise FleetError(
-                f"no remote path for {target.name!r}: the target defines no "
-                "`workdir` and the current directory has no project binding."
-            )
-        canonical_local = None
-        if args.delete:
-            ensure_sync_delete_allowed(
-                default_remote, target, direction=args.direction, force=bool(args.force)
-            )
-            if args.direction == "pull":
-                canonical_local = ensure_local_sync_delete_allowed(args.local_path)
-        attempt.connecting = True
-        ssh_runtime = plan.connect()
-        if args.delete:
-            canonical, remote_home, canonical_workdir = resolve_remote_delete_path(
-                secret, default_remote, ssh_runtime, target.workdir
-            )
-            ensure_remote_home_not_target(canonical, remote_home, target)
-            ensure_sync_delete_allowed(
-                canonical, replace(target, workdir=canonical_workdir),
-                direction=args.direction, force=bool(args.force)
-            )
-            # Use the checked physical destination, not an alias that could
-            # be repointed between the guard and rsync.
-            default_remote = canonical
-        excludes = list(DEFAULT_SYNC_EXCLUDES)
-        if plan.binding is not None:
-            excludes.extend(plan.binding.sync_excludes)
-        command = ["rsync", "-a"]
-        if level:
-            command += ["-z", f"--compress-level={level}"]
-        if args.delete:
-            command.append("--delete")
-        for pattern in excludes:
-            command += ["--exclude", pattern]
-        if args.direction == "push" and not args.dry_run:
-            remote_parent = posixpath.dirname(default_remote.rstrip("/")) or "."
-            mkdir = run_ssh_command(
-                secret,
-                allocate_tty=False,
-                remote_command=remote_shell_path_command(["mkdir", "-p"], remote_parent),
-                timeout=CONTROL_COMMAND_TIMEOUT,
-                **ssh_runtime,
-            )
-            if mkdir.returncode != 0:
-                raise FleetError(
-                    f"failed to create remote parent path {remote_parent!r} on "
-                    f"{target.name!r}"
-                )
-        command += ["-e", build_rsync_transport(secret, **ssh_runtime)]
-        if args.direction == "push":
-            local_path = Path(args.local_path).expanduser().resolve()
-            local = str(local_path)
-            if local_path.is_dir():
-                local = f"{local.rstrip('/')}/"
-            remote = f"{secret.target}:{default_remote}"
-            command += [local, remote]
-        else:
-            local = str(canonical_local or Path(args.local_path).expanduser().resolve())
-            remote = f"{secret.target}:{default_remote.rstrip('/')}/"
-            command += [remote, local]
-        if args.dry_run:
-            # sync's --dry-run is remote-accurate (a real rsync --dry-run), not
-            # a local simulation, so it is still the "primary command sent"
-            # below rather than an early, unconnected return.
-            command[1:1] = ["--dry-run", "--itemize-changes"]
-        if byte_cost is not None:
-            # Last look before rsync reads the tree: the connect, delete guard
-            # and mkdir above can take seconds, and the budget covers only
-            # the size that was billed.
-            verify_sync_source_within_budget(args, byte_cost)
-        stdout_limit, stderr_limit = _capture_limits(args)
-        attempt.sent = True
-        completed = run_command(
-            command,
-            env=ssh_env(secret),
-            capture_output=True,
-            stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit,
-        )
-        outcome, may_have_executed = classify_returncode(completed.returncode)
-        envelope = build_result_envelope(
-            verb="sync",
-            target=plan.target.name,
-            route=plan.route,
-            outcome=outcome,
-            may_have_executed=may_have_executed,
-            exit_code=completed.returncode,
-            remote_exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-            stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-            duration_s=time.monotonic() - start,
-            error=None,
-            details={"direction": args.direction, "dry_run": bool(args.dry_run)},
-        )
-        emit_result_envelope(envelope)
-        return envelope["exit_code"]
-    except Exception as exc:  # noqa: BLE001
-        return _emit_json_failure("sync", attempt, start, exc)
+@dataclass(frozen=True)
+class PreparedSyncRsync:
+    """The checked rsync invocation shared by `sync push`/`sync pull`."""
+
+    command: list[str]
+    local: str
+    remote_path: str
+    excludes: list[str]
+    byte_cost: int | None
 
 
-def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
-    """Push, pull or transfer files with rsync."""
-    if getattr(args, "json", False):
-        return _json_sync(args, context)
-    level = args.compress_level
-    if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
-        raise FleetError(
-            f"--compress-level must be 0-{MAX_SYNC_COMPRESS_LEVEL}, got {level}. "
-            "0 turns compression off; the range holds for zlib and zstd alike, "
-            "so the level stays valid whichever rsync negotiates."
-        )
-    if args.direction == "transfer":
-        return command_sync_transfer(args, context, level=level)
-    plan = build_plan(context, args, "sync")
+def prepare_sync_rsync(
+    plan: Plan,
+    args: argparse.Namespace,
+    *,
+    level: int,
+    no_path_message: str,
+    attempt: Attempt | None = None,
+) -> PreparedSyncRsync:
+    """Budget, guard, connect and build the rsync argv for push/pull.
+
+    Both the text and the `--json` path run this, so they cannot drift.  Only
+    NO_PATH_MESSAGE differs between them (the text path suggests remedies).
+    ATTEMPT, when given, is told the moment a connection is about to be paid.
+    """
     target = plan.target
     secret = plan.secret
     # Unlike every other verb's --dry-run, sync's is remote-accurate (it hands
@@ -11126,21 +9973,16 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         else plan.cwd
     )
     if not default_remote:
-        raise FleetError(
-            f"no remote path for {target.name!r}: the target defines no `workdir` and "
-            "the current directory has no project binding. Pass an explicit remote "
-            "path, set `workdir` on the target, or run `fleetctl project bind`."
-        )
+        raise FleetError(no_path_message)
     canonical_local = None
     if args.delete:
         ensure_sync_delete_allowed(
-            default_remote,
-            target,
-            direction=args.direction,
-            force=bool(args.force),
+            default_remote, target, direction=args.direction, force=bool(args.force)
         )
         if args.direction == "pull":
             canonical_local = ensure_local_sync_delete_allowed(args.local_path)
+    if attempt is not None:
+        attempt.connecting = True
     ssh_runtime = plan.connect()
     if args.delete:
         canonical, remote_home, canonical_workdir = resolve_remote_delete_path(
@@ -11148,9 +9990,13 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         )
         ensure_remote_home_not_target(canonical, remote_home, target)
         ensure_sync_delete_allowed(
-            canonical, replace(target, workdir=canonical_workdir),
-            direction=args.direction, force=bool(args.force)
+            canonical,
+            replace(target, workdir=canonical_workdir),
+            direction=args.direction,
+            force=bool(args.force),
         )
+        # Use the checked physical destination, not an alias that could
+        # be repointed between the guard and rsync.
         default_remote = canonical
 
     excludes = list(DEFAULT_SYNC_EXCLUDES)
@@ -11175,7 +10021,8 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         )
         if mkdir.returncode != 0:
             raise FleetError(
-                f"failed to create remote parent path {remote_parent!r} on {target.name!r}"
+                f"failed to create remote parent path {remote_parent!r} on "
+                f"{target.name!r}"
             )
     command += ["-e", build_rsync_transport(secret, **ssh_runtime)]
 
@@ -11198,16 +10045,101 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         # The one verb where a dry run is remote-accurate rather than a local
         # simulation: rsync itself reports exactly what it would transfer.
         command[1:1] = ["--dry-run", "--itemize-changes"]
+    return PreparedSyncRsync(command, local, default_remote, excludes, byte_cost)
+
+
+def _json_sync(args: argparse.Namespace, context: FleetContext) -> int:
+    """The `--json` path for `sync push`/`sync pull`/`sync transfer`."""
+    start = time.monotonic()
+    attempt = Attempt()
+    try:
+        _reject_json_fanout(args)
+        level = args.compress_level
+        if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
+            raise FleetError(
+                f"--compress-level must be 0-{MAX_SYNC_COMPRESS_LEVEL}, got {level}."
+            )
+        if args.direction == "transfer":
+            return _json_sync_transfer(
+                args, context, level=level, start=start, attempt=attempt
+            )
+        plan = build_plan(context, args, "sync")
+        attempt.plan = plan
+        prepared = prepare_sync_rsync(
+            plan,
+            args,
+            level=level,
+            no_path_message=(
+                f"no remote path for {plan.target.name!r}: the target defines no "
+                "`workdir` and the current directory has no project binding."
+            ),
+            attempt=attempt,
+        )
+        command = prepared.command
+        secret = plan.secret
+        if prepared.byte_cost is not None:
+            # Last look before rsync reads the tree: the connect, delete guard
+            # and mkdir above can take seconds, and the budget covers only
+            # the size that was billed.
+            verify_sync_source_within_budget(args, prepared.byte_cost)
+        stdout_limit, stderr_limit = _capture_limits(args)
+        attempt.sent = True
+        completed = run_command(
+            command,
+            env=ssh_env(secret),
+            capture_output=True,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+        )
+        return emit_completed_envelope(
+            "sync",
+            plan,
+            completed,
+            start,
+            {"direction": args.direction, "dry_run": bool(args.dry_run)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _emit_json_failure("sync", attempt, start, exc)
+
+
+def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
+    """Push, pull or transfer files with rsync."""
+    if getattr(args, "json", False):
+        return _json_sync(args, context)
+    level = args.compress_level
+    if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
+        raise FleetError(
+            f"--compress-level must be 0-{MAX_SYNC_COMPRESS_LEVEL}, got {level}. "
+            "0 turns compression off; the range holds for zlib and zstd alike, "
+            "so the level stays valid whichever rsync negotiates."
+        )
+    if args.direction == "transfer":
+        return command_sync_transfer(args, context, level=level)
+    plan = build_plan(context, args, "sync")
+    secret = plan.secret
+    prepared = prepare_sync_rsync(
+        plan,
+        args,
+        level=level,
+        no_path_message=(
+            f"no remote path for {plan.target.name!r}: the target defines no "
+            "`workdir` and the current directory has no project binding. Pass an "
+            "explicit remote path, set `workdir` on the target, or run "
+            "`fleetctl project bind`."
+        ),
+    )
+    command = prepared.command
+    if args.dry_run:
         report_plan(
             plan,
             args,
             {
                 "direction": args.direction,
-                "local_path": local,
-                "remote_path": default_remote,
+                "local_path": prepared.local,
+                "remote_path": prepared.remote_path,
                 "delete": bool(args.delete),
                 "compress_level": level,
-                "excludes": excludes,
+                "excludes": prepared.excludes,
                 "rsync": shlex.join(command),
             },
         )
@@ -11216,9 +10148,9 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         # its way out before it starts, or a piped run interleaves them.
         sys.stdout.flush()
 
-    if byte_cost is not None:
+    if prepared.byte_cost is not None:
         # Last look before rsync reads the tree; see _json_sync.
-        verify_sync_source_within_budget(args, byte_cost)
+        verify_sync_source_within_budget(args, prepared.byte_cost)
     completed = run_command(command, env=ssh_env(secret))
     return completed.returncode
 
@@ -11590,10 +10522,18 @@ def report_transfer_plan(
     return 0
 
 
-def command_sync_transfer(
-    args: argparse.Namespace, context: FleetContext, *, level: int
-) -> int:
-    """Move a tree between two targets: peer-to-peer first, relay as fallback."""
+def prepare_sync_transfer(
+    args: argparse.Namespace,
+    context: FleetContext,
+    *,
+    attempt: Attempt | None = None,
+) -> tuple[Plan, Plan, str, str, list[str]]:
+    """Validate a `sync transfer`'s endpoints and resolve both plans and paths.
+
+    Shared by the text and `--json` paths.  Returns the source plan, the
+    destination plan, both resolved paths and the rsync excludes.  ATTEMPT,
+    when given, records the destination plan as soon as it exists.
+    """
     if getattr(args, "expected_role", None):
         raise FleetError("--expected-role is not supported with `sync transfer`.")
     if args.selector:
@@ -11613,6 +10553,8 @@ def command_sync_transfer(
     # the audit line records the endpoint that gets written to.
     args.selector = dest_name
     dest_plan = build_plan(context, args, "sync")
+    if attempt is not None:
+        attempt.plan = dest_plan
     if source_plan.target.name == dest_plan.target.name:
         raise FleetError(
             "source and destination both resolve to "
@@ -11630,7 +10572,81 @@ def command_sync_transfer(
     excludes = list(DEFAULT_SYNC_EXCLUDES)
     if binding is not None:
         excludes.extend(binding.sync_excludes)
+    return source_plan, dest_plan, source_path, dest_path, excludes
 
+
+def enforce_transfer_budget(
+    source_plan: Plan, dest_plan: Plan, args: argparse.Namespace
+) -> None:
+    """Charge a transfer against both endpoints' own protocol budgets.
+
+    A transfer touches both endpoints' control planes, so each is charged
+    against its own protocol's budget (a no-op wherever none is configured).
+    """
+    byte_cost = central_sync_budget_bytes(args, source_plan, dest_plan)
+    enforce_control_budget(
+        source_plan, args, "sync", byte_cost=byte_cost, session_cost=4
+    )
+    enforce_control_budget(
+        dest_plan, args, "sync", byte_cost=byte_cost, session_cost=3
+    )
+
+
+def run_transfer_legs(
+    source_plan: Plan,
+    dest_plan: Plan,
+    source_path: str,
+    dest_path: str,
+    args: argparse.Namespace,
+    *,
+    level: int,
+    excludes: list[str],
+    notify: Callable[[str], None] | None = None,
+) -> tuple[int, bool]:
+    """Run a transfer peer-first with the relay as fallback.
+
+    Returns `(returncode, used_relay)`.  A peer rsync that may have changed the
+    destination (`PeerTransferUncertain`), or `--no-fallback`, stops rather
+    than repeating through the relay.  NOTIFY, when given, receives the
+    operator-facing routing notes (the text path prints them to stderr).
+    """
+    legs = {
+        "level": level,
+        "delete": bool(args.delete),
+        "force": bool(args.force),
+        "excludes": excludes,
+    }
+    if args.relay:
+        if notify is not None:
+            notify(
+                "note: --relay: routing through this machine rather than "
+                "peer-to-peer"
+            )
+    else:
+        try:
+            code = run_peer_transfer(
+                source_plan, dest_plan, source_path, dest_path, **legs
+            )
+            return code, False
+        except FleetError as error:
+            if isinstance(error, PeerTransferUncertain) or args.no_fallback:
+                raise
+            if notify is not None:
+                notify(
+                    f"note: peer transfer did not run ({error}); routing through "
+                    "this machine instead (--relay skips the peer attempt)"
+                )
+    code = run_relay_transfer(source_plan, dest_plan, source_path, dest_path, **legs)
+    return code, True
+
+
+def command_sync_transfer(
+    args: argparse.Namespace, context: FleetContext, *, level: int
+) -> int:
+    """Move a tree between two targets: peer-to-peer first, relay as fallback."""
+    source_plan, dest_plan, source_path, dest_path, excludes = prepare_sync_transfer(
+        args, context
+    )
     if args.dry_run:
         return report_transfer_plan(
             source_plan,
@@ -11642,53 +10658,18 @@ def command_sync_transfer(
             excludes=excludes,
         )
 
-    # A transfer touches both endpoints' control planes, so each is charged
-    # against its own protocol's budget (a no-op wherever none is configured).
-    byte_cost = central_sync_budget_bytes(args, source_plan, dest_plan)
-    enforce_control_budget(
-        source_plan, args, "sync", byte_cost=byte_cost, session_cost=4
-    )
-    enforce_control_budget(
-        dest_plan, args, "sync", byte_cost=byte_cost, session_cost=3
-    )
-
-    if not args.relay:
-        try:
-            return run_peer_transfer(
-                source_plan,
-                dest_plan,
-                source_path,
-                dest_path,
-                level=level,
-                delete=bool(args.delete),
-                force=bool(args.force),
-                excludes=excludes,
-            )
-        except FleetError as error:
-            if isinstance(error, PeerTransferUncertain):
-                raise
-            if args.no_fallback:
-                raise
-            print(
-                f"note: peer transfer did not run ({error}); routing through this "
-                "machine instead (--relay skips the peer attempt)",
-                file=sys.stderr,
-            )
-    else:
-        print(
-            "note: --relay: routing through this machine rather than peer-to-peer",
-            file=sys.stderr,
-        )
-    return run_relay_transfer(
+    enforce_transfer_budget(source_plan, dest_plan, args)
+    code, _used_relay = run_transfer_legs(
         source_plan,
         dest_plan,
         source_path,
         dest_path,
+        args,
         level=level,
-        delete=bool(args.delete),
-        force=bool(args.force),
         excludes=excludes,
+        notify=lambda message: print(message, file=sys.stderr),
     )
+    return code
 
 
 @dataclass(frozen=True)
@@ -11761,6 +10742,127 @@ def render_submit_wrapper(
     return SubmitWrapper(text, job_name, output_dir, output_path, error_path)
 
 
+@dataclass(frozen=True)
+class PreparedSubmit:
+    """A scheduler submit, checked and staged up to the point of dispatch.
+
+    REMOTE_SCRIPT is what the scheduler is handed (the script itself under
+    `--native-batch`, else the staged wrapper); it is None on a dry run, which
+    stages nothing.  WRAPPER and QUEUE are None under `--native-batch`.
+    """
+
+    native_batch: bool
+    planned_script: str
+    inline: bool
+    queue: QueueRecord | None
+    wrapper: SubmitWrapper | None
+    remote_script: str | None
+
+    @property
+    def output_path(self) -> str | None:
+        return self.wrapper.output_path if self.wrapper else None
+
+    @property
+    def error_path(self) -> str | None:
+        return self.wrapper.error_path if self.wrapper else None
+
+
+def ensure_direct_submit_allowed(plan: Plan, args: argparse.Namespace) -> None:
+    """Refuse the flags that mean nothing for a profile with no scheduler."""
+    if args.native_batch:
+        raise FleetError("`--native-batch` only applies to scheduler profiles")
+    ensure_no_resource_flags(
+        args,
+        because=(
+            f"profile {plan.profile.name!r} runs the script directly over SSH on "
+            f"{plan.target.name!r}; there is no scheduler to allocate resources"
+        ),
+    )
+
+
+def prepare_scheduler_submit(
+    plan: Plan,
+    args: argparse.Namespace,
+    local_script: Path,
+    ssh_runtime: dict[str, Any],
+    *,
+    no_queue_hint: str = "",
+) -> PreparedSubmit:
+    """Validate, render and stage a scheduler submit (`--native-batch` or queue).
+
+    Shared by the text and `--json` paths, which differ only in how they report
+    a dry run and how they dispatch.  A dry run stops before anything is staged;
+    otherwise the script (native) or the rendered wrapper (queue) is staged
+    and REMOTE_SCRIPT names it.  NO_QUEUE_HINT is appended to the internal
+    error raised when the plan resolved no queue.
+    """
+    profile, protocol, target, secret = (
+        plan.profile,
+        plan.protocol,
+        plan.target,
+        plan.secret,
+    )
+    planned = planned_script_path(profile, local_script)
+    if args.native_batch:
+        if args.script_args:
+            raise FleetError(
+                "`fleetctl submit --native-batch` does not accept extra script arguments"
+            )
+        ensure_no_resource_flags(
+            args,
+            because=(
+                "`--native-batch` submits your script unchanged, so its own #SBATCH "
+                "directives decide resources; edit the script instead"
+            ),
+        )
+        ensure_job_id_pattern(profile)
+        if args.dry_run:
+            return PreparedSubmit(True, planned, False, None, None, None)
+        remote_script = stage_remote_script(
+            secret, profile, local_script, ssh_runtime=ssh_runtime
+        )
+        return PreparedSubmit(True, planned, False, None, None, remote_script)
+
+    if protocol.native_batch_required:
+        raise FleetError(
+            f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
+            "so the scheduler receives the site-native batch script unchanged"
+        )
+    ensure_job_id_pattern(profile)
+    queue = plan.queue
+    if queue is None:
+        raise FleetError(
+            f"internal error: no queue resolved for {target.name!r}. plan_queue() "
+            "and this branch disagree about which submit path this is." + no_queue_hint
+        )
+    # A payload small enough to inline (render_submit_wrapper embeds it in the
+    # wrapper -- see payload_fits_inline) is never staged on its own: only the
+    # wrapper is staged below, which is the whole point of inlining.  The path
+    # computed here is then a placeholder render_submit_wrapper/render_slurm_wrapper
+    # never actually reference.
+    inline = payload_fits_inline(local_script)
+    remote_script = (
+        planned
+        if args.dry_run or inline
+        else stage_remote_script(secret, profile, local_script, ssh_runtime=ssh_runtime)
+    )
+    wrapper = render_submit_wrapper(plan, args, local_script, remote_script)
+    if wrapper.output_dir and not args.dry_run:
+        ensure_remote_directory(secret, wrapper.output_dir, ssh_runtime=ssh_runtime)
+    if args.dry_run:
+        return PreparedSubmit(False, planned, inline, queue, wrapper, remote_script)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(wrapper.text)
+        wrapper_local = Path(handle.name)
+    try:
+        remote_wrapper = stage_remote_script(
+            secret, profile, wrapper_local, ssh_runtime=ssh_runtime
+        )
+    finally:
+        wrapper_local.unlink(missing_ok=True)
+    return PreparedSubmit(False, planned, inline, queue, wrapper, remote_wrapper)
+
+
 def _json_submit_dispatch(
     plan: Plan,
     profile: ProfileRecord,
@@ -11784,19 +10886,15 @@ def _json_submit_dispatch(
     that point would report a submission that in fact went through, in the
     one place --json exists to get exactly right.
     """
-    submit_argv = render_template_values(
-        profile.submit_command, script_path=remote_script, workdir=plan.cwd
-    )
-    attempt.sent = True
-    completed = run_ssh_command(
+    completed = run_submit_command(
         plan.secret,
-        allocate_tty=False,
-        remote_command=remote_shell_command(submit_argv, cwd=plan.cwd),
-        capture_output=True,
-        timeout=SUBMIT_COMMAND_TIMEOUT,
+        profile,
+        remote_script=remote_script,
+        cwd=plan.cwd,
+        ssh_runtime=ssh_runtime,
+        attempt=attempt,
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
-        **ssh_runtime,
     )
     details: dict[str, Any] = {
         "job_id": None,
@@ -11806,19 +10904,12 @@ def _json_submit_dispatch(
     }
     outcome, may_have_executed = classify_returncode(completed.returncode)
     if completed.returncode == 0:
-        match = (
-            re.search(profile.job_id_pattern, completed.stdout or "")
-            if profile.job_id_pattern
-            else None
-        )
-        if match is None:
+        job_id = parse_submitted_job_id(profile, completed.stdout)
+        if job_id is None:
             # sbatch accepted the script -- it may well be running -- but the
             # id could not be parsed, so nothing downstream can be keyed on it.
             outcome, may_have_executed = "malformed_response", True
         else:
-            job_id = match.groupdict().get("job_id") or (
-                match.group(1) if match.groups() else match.group(0)
-            )
             resolved_out = output_path.replace("%j", job_id) if output_path else None
             resolved_err = error_path.replace("%j", job_id) if error_path else None
             details.update(job_id=job_id, log_out=resolved_out, log_err=resolved_err)
@@ -11858,210 +10949,73 @@ def _json_submit(args: argparse.Namespace, context: FleetContext) -> int:
         plan = build_plan(context, args, "submit")
         attempt.plan = plan
         preflight_gate(plan, args, local_script)
-        target = plan.target
-        protocol = plan.protocol
         profile = plan.profile
-        secret = plan.secret
         stdout_limit, stderr_limit = _capture_limits(args)
         if not args.dry_run:
             enforce_control_budget(plan, args, "submit")
 
         if not profile.submit_command:
-            if args.native_batch:
-                raise FleetError("`--native-batch` only applies to scheduler profiles")
-            ensure_no_resource_flags(
-                args,
-                because=(
-                    f"profile {profile.name!r} runs the script directly over SSH on "
-                    f"{target.name!r}; there is no scheduler to allocate resources"
-                ),
-            )
+            ensure_direct_submit_allowed(plan, args)
             if args.dry_run:
-                envelope = build_result_envelope(
-                    verb="submit",
-                    target=plan.target.name,
-                    route=plan.route,
-                    outcome="ok",
-                    may_have_executed=False,
-                    exit_code=0,
-                    remote_exit_code=None,
-                    stdout="",
-                    stderr="",
-                    stdout_truncated=False,
-                    stderr_truncated=False,
-                    duration_s=time.monotonic() - start,
-                    error=None,
-                    details={
+                return emit_dry_run_envelope(
+                    "submit",
+                    plan,
+                    start,
+                    {
                         "dry_run": True,
                         "staged_as": planned_script_path(profile, local_script),
                     },
                 )
-                emit_result_envelope(envelope)
-                return 0
-            completed = run_script_plan_json(
+            completed = run_script_plan(
                 plan,
                 local_script,
                 interpreter=args.interpreter,
                 script_args=args.script_args,
                 attempt=attempt,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
+                capture={"stdout_limit": stdout_limit, "stderr_limit": stderr_limit},
             )
-            outcome, may_have_executed = classify_returncode(completed.returncode)
-            envelope = build_result_envelope(
-                verb="submit",
-                target=plan.target.name,
-                route=plan.route,
-                outcome=outcome,
-                may_have_executed=may_have_executed,
-                exit_code=completed.returncode,
-                remote_exit_code=completed.returncode,
-                stdout=completed.stdout or "",
-                stderr=completed.stderr or "",
-                stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-                stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-                duration_s=time.monotonic() - start,
-                error=None,
-            )
-            emit_result_envelope(envelope)
-            return envelope["exit_code"]
+            return emit_completed_envelope("submit", plan, completed, start)
 
         if not args.dry_run:
             attempt.connecting = True
         ssh_runtime = plan.ssh_runtime() if args.dry_run else plan.connect()
-
-        if args.native_batch:
-            if args.script_args:
-                raise FleetError(
-                    "`fleetctl submit --native-batch` does not accept extra script arguments"
-                )
-            ensure_no_resource_flags(
-                args,
-                because=(
-                    "`--native-batch` submits your script unchanged, so its own #SBATCH "
-                    "directives decide resources; edit the script instead"
-                ),
-            )
-            ensure_job_id_pattern(profile)
-            if args.dry_run:
-                envelope = build_result_envelope(
-                    verb="submit",
-                    target=plan.target.name,
-                    route=plan.route,
-                    outcome="ok",
-                    may_have_executed=False,
-                    exit_code=0,
-                    remote_exit_code=None,
-                    stdout="",
-                    stderr="",
-                    stdout_truncated=False,
-                    stderr_truncated=False,
-                    duration_s=time.monotonic() - start,
-                    error=None,
-                    details={
-                        "dry_run": True,
-                        "native_batch": True,
-                        "staged_as": planned_script_path(profile, local_script),
-                    },
-                )
-                emit_result_envelope(envelope)
-                return 0
-            remote_script = stage_remote_script(
-                secret, profile, local_script, ssh_runtime=ssh_runtime
-            )
-            result = _json_submit_dispatch(
-                plan,
-                profile,
-                remote_script=remote_script,
-                ssh_runtime=ssh_runtime,
-                output_path=None,
-                error_path=None,
-                ledger_record=job_ledger_record(plan, local_script),
-                attempt=attempt,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
-            )
-        else:
-            if protocol.native_batch_required:
-                raise FleetError(
-                    f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
-                    "so the scheduler receives the site-native batch script unchanged"
-                )
-            ensure_job_id_pattern(profile)
-            queue = plan.queue
-            if queue is None:
-                raise FleetError(
-                    f"internal error: no queue resolved for {target.name!r}. plan_queue() "
-                    "and this branch disagree about which submit path this is."
-                )
-            inline = payload_fits_inline(local_script)
-            remote_script = (
-                planned_script_path(profile, local_script)
-                if args.dry_run or inline
-                else stage_remote_script(
-                    secret, profile, local_script, ssh_runtime=ssh_runtime
-                )
-            )
-            wrapper = render_submit_wrapper(plan, args, local_script, remote_script)
-            output_dir, output_path, error_path = (
-                wrapper.output_dir,
-                wrapper.output_path,
-                wrapper.error_path,
-            )
-            wrapper_text = wrapper.text
-            if output_dir and not args.dry_run:
-                ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
-            if args.dry_run:
-                envelope = build_result_envelope(
-                    verb="submit",
-                    target=plan.target.name,
-                    route=plan.route,
-                    outcome="ok",
-                    may_have_executed=False,
-                    exit_code=0,
-                    remote_exit_code=None,
-                    stdout="",
-                    stderr="",
-                    stdout_truncated=False,
-                    stderr_truncated=False,
-                    duration_s=time.monotonic() - start,
-                    error=None,
-                    details={
-                        "dry_run": True,
-                        "queue": queue.name,
-                        "partition": queue.partition,
-                        "job_name": wrapper.job_name,
-                        "staged_as": "(inlined into wrapper)" if inline else remote_script,
-                        "output_path": output_path,
-                        "error_path": error_path,
-                        "rendered_wrapper": wrapper_text,
-                    },
-                )
-                emit_result_envelope(envelope)
-                return 0
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", delete=False
-            ) as handle:
-                handle.write(wrapper_text)
-                wrapper_local = Path(handle.name)
-            try:
-                remote_wrapper = stage_remote_script(
-                    secret, profile, wrapper_local, ssh_runtime=ssh_runtime
-                )
-            finally:
-                wrapper_local.unlink(missing_ok=True)
-            result = _json_submit_dispatch(
-                plan,
-                profile,
-                remote_script=remote_wrapper,
-                ssh_runtime=ssh_runtime,
-                output_path=output_path,
-                error_path=error_path,
-                ledger_record=job_ledger_record(plan, local_script),
-                attempt=attempt,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
-            )
+        prepared = prepare_scheduler_submit(plan, args, local_script, ssh_runtime)
+        if args.dry_run:
+            if prepared.native_batch:
+                details: dict[str, Any] = {
+                    "dry_run": True,
+                    "native_batch": True,
+                    "staged_as": prepared.planned_script,
+                }
+            else:
+                assert prepared.queue is not None and prepared.wrapper is not None
+                details = {
+                    "dry_run": True,
+                    "queue": prepared.queue.name,
+                    "partition": prepared.queue.partition,
+                    "job_name": prepared.wrapper.job_name,
+                    "staged_as": (
+                        "(inlined into wrapper)"
+                        if prepared.inline
+                        else prepared.planned_script
+                    ),
+                    "output_path": prepared.output_path,
+                    "error_path": prepared.error_path,
+                    "rendered_wrapper": prepared.wrapper.text,
+                }
+            return emit_dry_run_envelope("submit", plan, start, details)
+        result = _json_submit_dispatch(
+            plan,
+            profile,
+            remote_script=prepared.remote_script,
+            ssh_runtime=ssh_runtime,
+            output_path=prepared.output_path,
+            error_path=prepared.error_path,
+            ledger_record=job_ledger_record(plan, local_script),
+            attempt=attempt,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+        )
 
         completed = result["completed"]
         envelope = build_result_envelope(
@@ -12095,10 +11049,7 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
         raise FleetError(f"missing local script: {local_script}")
     plan = build_plan(context, args, "submit")
     preflight_gate(plan, args, local_script)
-    target = plan.target
-    protocol = plan.protocol
     profile = plan.profile
-    secret = plan.secret
     # A dry run spends no control-budget token: it never connects, so there is
     # nothing to protect the cluster's control plane from yet.
     if not args.dry_run:
@@ -12106,7 +11057,6 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     # A dry run must not open a connection, so it describes the first route
     # instead of establishing one; a real submit takes the route that comes up.
     ssh_runtime = plan.ssh_runtime() if args.dry_run else plan.connect()
-    cwd = plan.cwd
 
     # Two paths, and the profile itself says which: a profile submits if and only
     # if it defines `submit_command`.  Dispatching on a separate `profile.kind`
@@ -12115,15 +11065,7 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     # mismatch -- an error pointing the operator at running the job on the login
     # node.  check_protocol_profile() now makes that disagreement unrepresentable.
     if not profile.submit_command:
-        if args.native_batch:
-            raise FleetError("`--native-batch` only applies to scheduler profiles")
-        ensure_no_resource_flags(
-            args,
-            because=(
-                f"profile {profile.name!r} runs the script directly over SSH on "
-                f"{target.name!r}; there is no scheduler to allocate resources"
-            ),
-        )
+        ensure_direct_submit_allowed(plan, args)
         if args.dry_run:
             return report_script_plan(
                 plan,
@@ -12137,87 +11079,28 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             local_script,
             interpreter=args.interpreter,
             script_args=args.script_args,
-            tty=False,
-        )
+        ).returncode
 
-    if args.native_batch:
-        if args.script_args:
-            raise FleetError(
-                "`fleetctl submit --native-batch` does not accept extra script arguments"
-            )
-        ensure_no_resource_flags(
-            args,
-            because=(
-                "`--native-batch` submits your script unchanged, so its own #SBATCH "
-                "directives decide resources; edit the script instead"
-            ),
-        )
-        ensure_job_id_pattern(profile)
-        if args.dry_run:
+    prepared = prepare_scheduler_submit(
+        plan,
+        args,
+        local_script,
+        ssh_runtime,
+        no_queue_hint="; they are meant to test the same three conditions in the same order.",
+    )
+    if args.dry_run:
+        if prepared.native_batch:
             return report_plan(
                 plan,
                 args,
                 {
                     "local_script": str(local_script),
-                    "staged_as": planned_script_path(profile, local_script),
+                    "staged_as": prepared.planned_script,
                     "native_batch": True,
                     "submit_command": shlex.join(profile.submit_command),
                 },
             )
-        remote_script = stage_remote_script(
-            secret,
-            profile,
-            local_script,
-            ssh_runtime=ssh_runtime,
-        )
-        return submit_staged_script(
-            secret,
-            profile,
-            remote_script=remote_script,
-            cwd=cwd,
-            ssh_runtime=ssh_runtime,
-            ledger=(context.paths, job_ledger_record(plan, local_script)),
-        )
-
-    if protocol.native_batch_required:
-        raise FleetError(
-            f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
-            "so the scheduler receives the site-native batch script unchanged"
-        )
-    ensure_job_id_pattern(profile)
-    queue = plan.queue
-    if queue is None:
-        raise FleetError(
-            f"internal error: no queue resolved for {target.name!r}. plan_queue() "
-            "and this branch disagree about which submit path this is; they are "
-            "meant to test the same three conditions in the same order."
-        )
-    # A payload small enough to inline (render_submit_wrapper embeds it in the
-    # wrapper -- see payload_fits_inline) is never staged on its own: only the
-    # wrapper is staged below, which is the whole point of inlining.  The path
-    # computed here is then a placeholder render_submit_wrapper/render_slurm_wrapper
-    # never actually reference.
-    inline = payload_fits_inline(local_script)
-    remote_script = (
-        planned_script_path(profile, local_script)
-        if args.dry_run or inline
-        else stage_remote_script(
-            secret,
-            profile,
-            local_script,
-            ssh_runtime=ssh_runtime,
-        )
-    )
-    wrapper = render_submit_wrapper(plan, args, local_script, remote_script)
-    output_dir, output_path, error_path = (
-        wrapper.output_dir,
-        wrapper.output_path,
-        wrapper.error_path,
-    )
-    job_name, wrapper_text = wrapper.job_name, wrapper.text
-    if output_dir and not args.dry_run:
-        ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
-    if args.dry_run:
+        assert prepared.queue is not None and prepared.wrapper is not None
         # The whole point of a submit dry run: read the wrapper the scheduler
         # would receive, before it receives it.
         return report_plan(
@@ -12225,36 +11108,28 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             args,
             {
                 "local_script": str(local_script),
-                "staged_as": "(inlined into wrapper)" if inline else remote_script,
-                "queue": queue.name,
-                "partition": queue.partition,
-                "job_name": job_name,
-                "output_path": output_path,
-                "error_path": error_path,
+                "staged_as": (
+                    "(inlined into wrapper)"
+                    if prepared.inline
+                    else prepared.planned_script
+                ),
+                "queue": prepared.queue.name,
+                "partition": prepared.queue.partition,
+                "job_name": prepared.wrapper.job_name,
+                "output_path": prepared.output_path,
+                "error_path": prepared.error_path,
                 "submit_command": shlex.join(profile.submit_command),
             },
-            block=("rendered batch script", wrapper_text),
+            block=("rendered batch script", prepared.wrapper.text),
         )
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-        handle.write(wrapper_text)
-        wrapper_local = Path(handle.name)
-    try:
-        remote_wrapper = stage_remote_script(
-            secret,
-            profile,
-            wrapper_local,
-            ssh_runtime=ssh_runtime,
-        )
-    finally:
-        wrapper_local.unlink(missing_ok=True)
     return submit_staged_script(
-        secret,
+        plan.secret,
         profile,
-        remote_script=remote_wrapper,
-        cwd=cwd,
+        remote_script=prepared.remote_script,
+        cwd=plan.cwd,
         ssh_runtime=ssh_runtime,
-        output_path=output_path,
-        error_path=error_path,
+        output_path=prepared.output_path,
+        error_path=prepared.error_path,
         ledger=(context.paths, job_ledger_record(plan, local_script)),
     )
 
@@ -12313,63 +11188,72 @@ def run_job_command(
     return code
 
 
-def job_command_output(
-    plan: Plan, template: tuple[str, ...], *, job_id: str
-) -> tuple[int, str, str]:
-    """Run one scheduler command and hand back what it printed."""
-    if not template:
-        raise FleetError(
-            f"profile {plan.profile.name!r} does not support this job operation"
-        )
-    argv = render_template_values(template, job_id=job_id, workdir=plan.cwd)
-    completed = run_ssh_command(
-        plan.secret,
-        allocate_tty=False,
-        remote_command=remote_shell_command(argv, cwd=plan.cwd),
-        capture_output=True,
-        timeout=CONTROL_COMMAND_TIMEOUT,
-        **plan.connect(),
-    )
-    return completed.returncode, completed.stdout or "", completed.stderr or ""
-
-
-def job_command_output_json(
+def run_job_template(
     plan: Plan,
     template: tuple[str, ...],
     *,
     job_id: str,
-    attempt: Attempt,
-    stdout_limit: int,
-    stderr_limit: int,
+    attempt: Attempt | None = None,
+    **capture: int,
 ) -> subprocess.CompletedProcess[str]:
-    """job_command_output's logic, tracking ATTEMPT and capturing bounded output.
+    """Run one scheduler command from PLAN's profile, capturing what it printed.
 
-    Unlike `submit`/`sync`, there is no separate staging round trip here: the
-    scheduler command *is* the primary command, so `connected` and `sent`
-    become true together, right before it runs.
+    ATTEMPT (the `--json` path) is told when the connection is about to be
+    paid and when the command goes out.  Unlike `submit`/`sync`, there is no
+    separate staging round trip here: the scheduler command *is* the primary
+    command, so `connected` and `sent` become true together.  CAPTURE passes
+    `stdout_limit`/`stderr_limit` through.
     """
     if not template:
         raise FleetError(
             f"profile {plan.profile.name!r} does not support this job operation"
         )
     argv = render_template_values(template, job_id=job_id, workdir=plan.cwd)
-    attempt.connecting = True
+    if attempt is not None:
+        attempt.connecting = True
     ssh_runtime = plan.connect()
-    attempt.sent = True
+    if attempt is not None:
+        attempt.sent = True
     return run_ssh_command(
         plan.secret,
         allocate_tty=False,
         remote_command=remote_shell_command(argv, cwd=plan.cwd),
         capture_output=True,
         timeout=CONTROL_COMMAND_TIMEOUT,
-        stdout_limit=stdout_limit,
-        stderr_limit=stderr_limit,
+        **capture,
         **ssh_runtime,
     )
 
 
-def _json_job_status(args: argparse.Namespace, context: FleetContext) -> int:
-    """The `--json` path for `job status`. Fan-out is refused (_reject_json_fanout)."""
+def job_command_output(
+    plan: Plan, template: tuple[str, ...], *, job_id: str
+) -> tuple[int, str, str]:
+    """Run one scheduler command and hand back what it printed."""
+    completed = run_job_template(plan, template, job_id=job_id)
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def planned_job_command(
+    plan: Plan, template: tuple[str, ...], *, job_id: str
+) -> str | None:
+    """The scheduler command a `job` verb would run, for a `--dry-run` report."""
+    if not template:
+        return None
+    return shlex.join(render_template_values(template, job_id=job_id, workdir=plan.cwd))
+
+
+def _json_job(
+    args: argparse.Namespace,
+    context: FleetContext,
+    template_name: str,
+    *,
+    dry_run_reports: bool = False,
+) -> int:
+    """The `--json` path for the `job` verbs. Fan-out is refused (_reject_json_fanout).
+
+    TEMPLATE_NAME is the profile field naming the scheduler command to run.
+    With DRY_RUN_REPORTS, `--dry-run` prints the planned command instead.
+    """
     start = time.monotonic()
     attempt = Attempt()
     try:
@@ -12377,35 +11261,33 @@ def _json_job_status(args: argparse.Namespace, context: FleetContext) -> int:
         apply_job_ledger_defaults(args, context)
         plan = build_plan(context, args, "job")
         attempt.plan = plan
+        template = getattr(plan.profile, template_name)
+        if dry_run_reports and args.dry_run:
+            return emit_dry_run_envelope(
+                "job",
+                plan,
+                start,
+                {
+                    "dry_run": True,
+                    "job_id": args.job_id,
+                    "remote_command": planned_job_command(
+                        plan, template, job_id=args.job_id
+                    ),
+                },
+            )
         enforce_control_budget(plan, args, "job")
         stdout_limit, stderr_limit = _capture_limits(args)
-        completed = job_command_output_json(
+        completed = run_job_template(
             plan,
-            plan.profile.status_command,
+            template,
             job_id=args.job_id,
             attempt=attempt,
             stdout_limit=stdout_limit,
             stderr_limit=stderr_limit,
         )
-        outcome, may_have_executed = classify_returncode(completed.returncode)
-        envelope = build_result_envelope(
-            verb="job",
-            target=plan.target.name,
-            route=plan.route,
-            outcome=outcome,
-            may_have_executed=may_have_executed,
-            exit_code=completed.returncode,
-            remote_exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-            stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-            duration_s=time.monotonic() - start,
-            error=None,
-            details={"job_id": args.job_id},
+        return emit_completed_envelope(
+            "job", plan, completed, start, {"job_id": args.job_id}
         )
-        emit_result_envelope(envelope)
-        return envelope["exit_code"]
     except Exception as exc:  # noqa: BLE001
         return _emit_json_failure("job", attempt, start, exc)
 
@@ -12422,7 +11304,7 @@ def command_job_status(args: argparse.Namespace, context: FleetContext) -> int:
     shrink that set to one.
     """
     if getattr(args, "json", False):
-        return _json_job_status(args, context)
+        return _json_job(args, context, "status_command")
     if fanout_requested(args):
 
         def _status_work(plan: Plan) -> tuple[int, str, str]:
@@ -12443,84 +11325,10 @@ def command_job_logs(args: argparse.Namespace, context: FleetContext) -> int:
     return run_job_command(plan, plan.profile.logs_command, job_id=args.job_id)
 
 
-def _json_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
-    """The `--json` path for `job cancel`."""
-    start = time.monotonic()
-    attempt = Attempt()
-    try:
-        _reject_json_fanout(args)
-        apply_job_ledger_defaults(args, context)
-        plan = build_plan(context, args, "job")
-        attempt.plan = plan
-        if args.dry_run:
-            remote_command = (
-                shlex.join(
-                    render_template_values(
-                        plan.profile.cancel_command, job_id=args.job_id, workdir=plan.cwd
-                    )
-                )
-                if plan.profile.cancel_command
-                else None
-            )
-            envelope = build_result_envelope(
-                verb="job",
-                target=plan.target.name,
-                route=plan.route,
-                outcome="ok",
-                may_have_executed=False,
-                exit_code=0,
-                remote_exit_code=None,
-                stdout="",
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-                duration_s=time.monotonic() - start,
-                error=None,
-                details={
-                    "dry_run": True,
-                    "job_id": args.job_id,
-                    "remote_command": remote_command,
-                },
-            )
-            emit_result_envelope(envelope)
-            return 0
-        enforce_control_budget(plan, args, "job")
-        stdout_limit, stderr_limit = _capture_limits(args)
-        completed = job_command_output_json(
-            plan,
-            plan.profile.cancel_command,
-            job_id=args.job_id,
-            attempt=attempt,
-            stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit,
-        )
-        outcome, may_have_executed = classify_returncode(completed.returncode)
-        envelope = build_result_envelope(
-            verb="job",
-            target=plan.target.name,
-            route=plan.route,
-            outcome=outcome,
-            may_have_executed=may_have_executed,
-            exit_code=completed.returncode,
-            remote_exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
-            stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
-            duration_s=time.monotonic() - start,
-            error=None,
-            details={"job_id": args.job_id},
-        )
-        emit_result_envelope(envelope)
-        return envelope["exit_code"]
-    except Exception as exc:  # noqa: BLE001
-        return _emit_json_failure("job", attempt, start, exc)
-
-
 def command_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
     """Cancel one remote scheduler job."""
     if getattr(args, "json", False):
-        return _json_job_cancel(args, context)
+        return _json_job(args, context, "cancel_command", dry_run_reports=True)
     apply_job_ledger_defaults(args, context)
     plan = build_plan(context, args, "job")
     if args.dry_run:
@@ -12529,15 +11337,9 @@ def command_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
             args,
             {
                 "job_id": args.job_id,
-                "remote_command": shlex.join(
-                    render_template_values(
-                        plan.profile.cancel_command,
-                        job_id=args.job_id,
-                        workdir=plan.cwd,
-                    )
-                )
-                if plan.profile.cancel_command
-                else None,
+                "remote_command": planned_job_command(
+                    plan, plan.profile.cancel_command, job_id=args.job_id
+                ),
             },
         )
     enforce_control_budget(plan, args, "job")
@@ -12805,12 +11607,6 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
     payload = plan.describe()
     payload["ssh"] = shlex.join(plan.ssh_connect_argv())
     payload["socket"] = plan.ssh_runtime().get("control_path")
-    # Reported, never consulted: this names the route that last worked, not the
-    # one the next command will take.
-    last_used = read_route_state(context.paths).get(target.name)
-    payload["route_last_used"] = (
-        last_used.get("route") if isinstance(last_used, dict) else None
-    )
     payload["queues"] = [item.name for item in protocol.queues]
     payload["queue_problem"] = queue_problem
     # Every surface a requirement could match here, which is one per partition on
@@ -12870,7 +11666,6 @@ def command_doctor(args: argparse.Namespace) -> int:
     problems.extend(toml_syntax_problems(paths))
     try:
         warnings.extend(target_schema_warnings(paths.targets_dir))
-        warnings.extend(deprecated_key_warnings(paths))
     except FleetError:
         pass  # already reported precisely by toml_syntax_problems above
 
@@ -12935,7 +11730,7 @@ def command_doctor(args: argparse.Namespace) -> int:
                 warnings.append(
                     f"target {target.name!r} declares no `role`; fleetctl inferred "
                     f"{resolve_role(target, protocol)!r} from protocol "
-                    f"{protocol.name!r}. Run `fleetctl migrate-config` to make it "
+                    f"{protocol.name!r}. Set `role` in the target file to make it "
                     "explicit."
                 )
             try:
@@ -13233,7 +12028,7 @@ TARGET-TO-TARGET
 EVERYTHING ELSE
     Inventory   jobs, list, show, explain, resolve, protocol show,
                 queue list, project bind|show|list
-    Setup       init, import-ssh, migrate-config
+    Setup       init, import-ssh
     Secrets     seed-pass, deploy-config
     Diagnosis   doctor, probe, help
 
@@ -13298,7 +12093,7 @@ ADMISSION
 INFERENCE
     A target with no `role` gets the conservative reading of its
     protocol: "login" when the protocol schedules, "workstation" when
-    it runs work directly. An unmigrated fleet is therefore never less
+    it runs work directly. A target with no role is therefore never less
     guarded than it was before roles existed, and `doctor` names every
     target still relying on the guess.
 
@@ -13396,12 +12191,6 @@ FALLBACK
     routes is a warning there rather than a problem, since being out of
     reach is not a fault in the config. `list --format topology` prints
     the graph: each target's routes, and what each bridge carries.
-
-DEPRECATED
-    The secret key `proxy_jump` is accepted and ignored. Declare
-    `reach` instead; `migrate-config` lifts an old hop out for you. A
-    waypoint that is not itself a fleet target stays expressible as an
-    `[ssh_option]` ProxyJump entry.
 
 SEE ALSO
     fleetctl help roles, fleetctl help capabilities, fleetctl help config
@@ -13521,7 +12310,7 @@ SYNOPSIS
     $FLEET_CONFIG_HOME  (default ~/.config/fleet)
         config.toml  projects.toml
         targets.d/  pools.d/  protocols.d/  profiles.d/  secrets/
-    $FLEET_STATE_HOME   known_hosts  routes.json  jobs.jsonl  audit.jsonl
+    $FLEET_STATE_HOME   known_hosts  jobs.jsonl  audit.jsonl
                         facts/
     $FLEET_CACHE_HOME   mux/  (ssh control sockets)
 
@@ -13577,10 +12366,6 @@ VALIDATION
     is refused. Every role, protocol and profile disagreement is
     reported in one pass rather than one per run.
 
-    `[defaults]` has no valid keys left: `redact_sensitive_output` is
-    accepted and ignored. `fleetctl doctor` names every file still
-    carrying a deprecated key, and never prints its value.
-
 SEE ALSO
     fleetctl help secrets, fleetctl help reach, fleetctl help capabilities
 """,
@@ -13589,7 +12374,7 @@ NAME
     fleetctl secrets - connection material, kept out of the inventory
 
 SYNOPSIS
-    secret_backend = "file" | "pass" | "inline" | "command"
+    secret_backend = "file" | "pass"
     secret_ref = "<config-home>/secrets/<target>.toml"
     fleetctl show <target> --secret [--sensitive]
 
@@ -13605,28 +12390,12 @@ DESCRIPTION
     entry becomes one `-o key=value`, which is the escape hatch for
     everything fleetctl does not model.
 
-    Four backends: a private TOML file, a `pass` entry, a
-    `secret = { ... }` table inline in the target, or a command.
-    Resolution is lazy, on first use, so only the code that opens a
-    connection pays for it.
-
-    `secret_backend = "command"` runs `secret_ref` and reads the same
-    TOML off its stdout, merged over the target's inline `[secret]`
-    table. It is for the field that will not hold still -- a cloud box
-    whose address changes on every start -- so the address is resolved
-    at connect time by a script that already knows, rather than by
-    teaching fleetctl one provider's API and then the next one's. The
-    result is cached for 30 seconds, which covers a `sync push` and the
-    `submit` after it and not much else; a stale address is a
-    connection to whoever holds that address now. The cache is in
-    memory only, because a resolved secret on disk would be a second
-    secret store with none of the handling the first one gets.
-
-    Its stdout is a secret and is treated as one: redacted by `show`
-    like any other, and never quoted in an error. A failing upcall is a
-    refusal naming the command and its stderr -- never a partial secret
-    passed on to the connection layer, which would resolve to a host
-    nobody chose.
+    Two backends: a private TOML file (`secret_backend = "file"`, the
+    default, with `secret_ref` naming it) or a `pass` entry
+    (`secret_backend = "pass"`, `secret_ref` is the entry name). Any
+    other value, including the removed `inline` and `command`, is
+    refused at load time with the supported list. Resolution is lazy,
+    on first use, so only the code that opens a connection pays for it.
 
     A `host`, `user`, `port`, `password` or `identity_file` key in a
     target file is refused with that explanation, not a spelling hint:
@@ -13940,24 +12709,6 @@ def add_fanout_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_budget_flags(parser: argparse.ArgumentParser) -> None:
-    """Register `--budget-wait`, on every verb enforce_control_budget can gate.
-
-    A no-op unless the resolved protocol carries `[control_budget]`; see
-    acquire_local_budget for what WAIT actually does with it.
-    """
-    parser.add_argument(
-        "--budget-wait",
-        type=float,
-        default=0.0,
-        metavar="SECONDS",
-        help=(
-            "Block up to SECONDS for a control-budget token instead of refusing "
-            "immediately (exit 75) when the bucket is empty"
-        ),
-    )
-
-
 def add_timeout_flag(parser: argparse.ArgumentParser) -> None:
     """Register `--timeout`, the end-to-end deadline (see deadline_scope)."""
     parser.add_argument(
@@ -14239,35 +12990,6 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_config_parser.add_argument("--json", action="store_true", help="Emit JSON")
     deploy_config_parser.set_defaults(handler=command_deploy_config, loads_own_config=True)
 
-    migrate_config_parser = subparsers.add_parser(
-        "migrate-config",
-        help="Rewrite the live fleet config in the schema fleetctl reads today",
-    )
-    migrate_config_parser.add_argument(
-        "--role",
-        action="append",
-        default=[],
-        metavar="TARGET=ROLE",
-        help=(
-            "Set one target's role explicitly instead of letting fleetctl infer it "
-            f"({', '.join(ROLES)}); repeatable"
-        ),
-    )
-    migrate_config_parser.add_argument(
-        "--rename",
-        action="append",
-        default=[],
-        metavar="OLD=NEW",
-        help="Rename a target and follow the name through secrets, pools and "
-        "project bindings; repeatable",
-    )
-    migrate_config_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the migration and validate it, but leave the live config alone",
-    )
-    migrate_config_parser.set_defaults(handler=command_migrate_config, loads_own_config=True)
-
     import_ssh_parser = subparsers.add_parser(
         "import-ssh",
         help="Import one existing local SSH alias into fleet config",
@@ -14366,7 +13088,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refuse unless the resolved target has this inventory role",
     )
     add_connection_flags(exec_parser)
-    add_budget_flags(exec_parser)
     exec_parser.add_argument(
         "--op-class",
         choices=["monitor", "action", "transfer"],
@@ -14412,7 +13133,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve and print the plan without touching the target",
     )
     add_timeout_flag(script_parser)
-    add_budget_flags(script_parser)
     add_result_envelope_flags(script_parser)
     script_parser.set_defaults(handler=command_script)
 
@@ -14485,7 +13205,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_connection_flags(sync_parser)
-    add_budget_flags(sync_parser)
     sync_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -14555,7 +13274,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arguments for direct-profile submissions after `--`",
     )
     add_connection_flags(submit_parser)
-    add_budget_flags(submit_parser)
     submit_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -14593,7 +13311,6 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--profile", help="Execution profile override")
     status_parser.add_argument("--cwd", help="Remote working directory override")
     add_connection_flags(status_parser)
-    add_budget_flags(status_parser)
     add_timeout_flag(status_parser)
     add_result_envelope_flags(status_parser)
     status_parser.set_defaults(handler=command_job_status)
@@ -14612,7 +13329,6 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("--profile", help="Execution profile override")
     cancel_parser.add_argument("--cwd", help="Remote working directory override")
     add_connection_flags(cancel_parser)
-    add_budget_flags(cancel_parser)
     cancel_parser.add_argument(
         "--dry-run",
         action="store_true",

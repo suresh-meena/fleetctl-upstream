@@ -80,6 +80,30 @@ def test_documented_partition_passes(fleetctl):
     assert diag.confidence == "documented"
 
 
+def test_partition_comma_list_checks_each_name(fleetctl):
+    protocol = make_protocol(
+        fleetctl,
+        rule_prefix="KIAC",
+        queues=(
+            make_queue(fleetctl, name="a100", partition="a100", evidence="documented"),
+            make_queue(fleetctl, name="h200", partition="h200", evidence="documented"),
+        ),
+    )
+    rep, _ = run_site_policy(
+        fleetctl, protocol, "#!/bin/bash\n#SBATCH --partition=a100,h200\n"
+    )
+    assert not rep.errors
+    assert [d.level for d in rep.items if d.rule_id == "KIAC010"] == ["PASS"]
+    assert "KIAC012" in ids(rep)  # per-queue limits are not applied to a list
+
+    rep, _ = run_site_policy(
+        fleetctl, protocol, "#!/bin/bash\n#SBATCH --partition=a100,bogus\n"
+    )
+    diag = [d for d in rep.items if d.rule_id == "KIAC011"][0]
+    assert diag.level == "ERROR"
+    assert "bogus" in diag.message
+
+
 def test_example_only_partition_gets_info_not_silence(fleetctl):
     protocol = make_protocol(
         fleetctl,

@@ -1,8 +1,7 @@
 """Atomic writes and locks for shared mutable state (item 9).
 
-routes.json (record_route_state), known_hosts's first creation
-(write_text_if_missing) and the audit/ledger trim (append_jsonl) all do a
-read-modify-write under `flock_guard` now, with an atomic tmp+rename (or
+known_hosts's first creation (write_text_if_missing) and the audit/ledger
+trim (append_jsonl) all do a read-modify-write under `flock_guard` now, with an atomic tmp+rename (or
 tmp+fsync+rename) replace.  These tests hammer each with real concurrency --
 both threads (proves there is no silly ordering bug) and separate
 `multiprocessing.Process`es (the one that actually exercises `fcntl.flock`
@@ -19,78 +18,6 @@ from __future__ import annotations
 
 import multiprocessing
 import threading
-
-
-
-# -- routes.json: concurrent record_route_state never loses an update --------
-
-
-def test_concurrent_threads_recording_distinct_targets_lose_nothing(fleetctl, tmp_path):
-    paths = fleetctl.build_paths(
-        config_home=tmp_path / "c", state_home=tmp_path / "s", cache_home=tmp_path / "ca"
-    )
-    n = 40
-    barrier = threading.Barrier(n)
-
-    def worker(i: int) -> None:
-        barrier.wait()
-        fleetctl.record_route_state(paths, f"target-{i}", "direct", f"/tmp/sock-{i}")
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    state = fleetctl.read_route_state(paths)
-    assert len(state) == n, f"expected {n} recorded targets, got {len(state)}"
-    for i in range(n):
-        assert state[f"target-{i}"]["route"] == "direct"
-
-
-def _record_one_route(state_home: str, name: str) -> None:
-    """Top-level (picklable) worker for a separate OS process."""
-    import importlib.machinery
-    import importlib.util
-    import sys
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parent.parent
-    loader = importlib.machinery.SourceFileLoader("fleetctl", str(repo_root / "bin" / "fleetctl"))
-    spec = importlib.util.spec_from_loader("fleetctl", loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fleetctl"] = module
-    loader.exec_module(module)
-    paths = module.build_paths(
-        config_home=Path(state_home) / "c", state_home=Path(state_home), cache_home=Path(state_home) / "ca"
-    )
-    module.record_route_state(paths, name, "direct", f"/tmp/sock-{name}")
-
-
-def test_concurrent_processes_recording_distinct_targets_lose_nothing(tmp_path, fleetctl):
-    """The variant that actually exercises fcntl.flock across processes: two
-    threads in one interpreter are already serialized by the GIL around the
-    pure-Python read-modify-write, so only separate processes prove the lock
-    (rather than incidental ordering) is what prevents the lost update."""
-    state_home = tmp_path / "state"
-    n = 8
-    procs = [
-        multiprocessing.Process(target=_record_one_route, args=(str(state_home), f"p{i}"))
-        for i in range(n)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(timeout=30)
-        assert p.exitcode == 0
-
-    paths = fleetctl.build_paths(
-        config_home=tmp_path / "c", state_home=state_home, cache_home=tmp_path / "ca"
-    )
-    state = fleetctl.read_route_state(paths)
-    assert len(state) == n
-    for i in range(n):
-        assert f"p{i}" in state
 
 
 # -- known_hosts first creation: no "refusing to overwrite" race -------------

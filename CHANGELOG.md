@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Removed
+- `fleetctl migrate-config` and every deprecated-key allowance: a config still
+  carrying a formerly deprecated key (`scheduler`, `transport`, `ssh_host_alias`,
+  `metadata`, `job_runtime`, a pool's `strategy`, a secret's `proxy_jump`, ...)
+  now fails as an ordinary unknown key, and `doctor` no longer points at a
+  migration.
+- The `inline` and `command` secret backends (and the inline `[secret]` table);
+  only `file` and `pass` remain, and any other `secret_backend` is refused with
+  that list.
+- The per-machine control-budget token bucket and `--budget-wait`. A protocol
+  declaring `[control_budget]` must now set `authority_url` and
+  `authority_token_file`, or it fails to load; permits, `FLEETCTL_PERMIT` and
+  exit 75 on denial are unchanged.
+
 ### Changed
 - Lint `fleetctl` and its tests with a bug-focused ruff config (`bin/ruff.toml`;
   `ruff check bin/fleetctl tests`), and remove unused internals.

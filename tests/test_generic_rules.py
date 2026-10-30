@@ -127,11 +127,7 @@ def test_invalid_array_spec(fleetctl, kiac_protocol):
 def test_array_output_collision(fleetctl, kiac_protocol):
     rep = check(fleetctl, fixture("array_collision.sbatch"), kiac_protocol)
     assert "SLURM041" in ids(rep)
-    # logs/ does not exist relative to the fixture dir; sbatch opens output
-    # files at submit time, so this must be flagged even with %A/%a patterns
-    fs = [d for d in rep.items if d.rule_id == "FS003"]
-    assert fs and "mkdir -p logs" in fs[0].suggestion
-    assert rep.exit_code() == 1  # both findings are warnings
+    assert rep.exit_code() == 1  # the finding is a warning
 
 
 def test_strict_escalates_warnings(fleetctl, kiac_protocol):
@@ -251,22 +247,3 @@ def test_slurm080_task_geometry_mismatch(fleetctl):
     )
     diag = [d for d in rep.items if d.rule_id == "SLURM080"][0]
     assert diag.level == "WARN"
-
-
-def test_fs001_chdir_does_not_exist(fleetctl):
-    script = fleetctl.parse_text(
-        "#!/bin/bash\n#SBATCH --chdir=/definitely/not/a/real/path\necho hi\n"
-    )
-    rep = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep)
-    fs1 = [d for d in rep.items if d.rule_id == "FS001"]
-    # Host-relative: informational, never a refusal.
-    assert fs1 and fs1[0].level == "INFO"
-
-
-def test_fs002_missing_executable_path(fleetctl):
-    script = fleetctl.parse_text("#!/bin/bash\n/no/such/binary --flag\n")
-    rep = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep)
-    fs2 = [d for d in rep.items if d.rule_id == "FS002" and d.level == "INFO"]
-    assert fs2

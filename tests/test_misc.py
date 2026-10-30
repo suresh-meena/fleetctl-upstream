@@ -14,6 +14,7 @@ matches the `_CommandRunner.run(cmd) -> (rc, out)` shape fleetctl expects.
 
 from __future__ import annotations
 
+import pytest
 from _helpers import FakeRunner
 
 
@@ -101,93 +102,6 @@ def test_sh101_clean_and_dirty(fleetctl, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# MOD001 / MOD002 -- module resolution, entirely stubbed
-# ---------------------------------------------------------------------------
-
-
-def test_module_check_resolves_and_flags(fleetctl):
-    script = fleetctl.parse_text(
-        "#!/bin/bash\n#SBATCH --partition=a100\nmodule load python/3.11 cuda/12.1\n"
-    )
-
-    class ModRunner(FakeRunner):
-        def run(self, cmd):
-            super().run(cmd)
-            if cmd[:2] == ["bash", "-lc"] and "module show" in cmd[2]:
-                name = cmd[2].split(">/dev/null")[0].split()[-1].strip("'\"")
-                return (0, "") if name == "python/3.11" else (1, "error")
-            if cmd[:3] == ["bash", "-lc", "type module"]:
-                return 0, ""
-            return 0, ""
-
-    rep = fleetctl.Report()
-    fleetctl.check_modules(script, rep, ModRunner())
-    levels = [d.level for d in rep.items if d.rule_id == "MOD002"]
-    assert levels == ["PASS", "WARN"]  # python resolves, cuda flags
-
-
-def test_module_check_skips_when_modulecmd_absent(fleetctl):
-    script = fleetctl.parse_text(
-        "#!/bin/bash\n#SBATCH --partition=a100\nmodule load python/3.11\n"
-    )
-
-    class NoModRunner(FakeRunner):
-        def run(self, cmd):
-            super().run(cmd)
-            if cmd[:3] == ["bash", "-lc", "type module"]:
-                return 1, "not found"
-            return 0, ""
-
-    rep = fleetctl.Report()
-    fleetctl.check_modules(script, rep, NoModRunner())
-    assert rep.rule_ids() == ["MOD001"]
-
-
-def test_module_check_no_loads_is_silent(fleetctl):
-    script = fleetctl.parse_text("#!/bin/bash\n#SBATCH --partition=a100\necho hi\n")
-    rep = fleetctl.Report()
-    fleetctl.check_modules(script, rep, FakeRunner())
-    assert rep.rule_ids() == []
-
-
-# ---------------------------------------------------------------------------
-# FS001 / FS002 / FS003 -- filesystem references, against the real filesystem
-# (these deliberately touch a real tmp_path/cwd, same as the old suite did;
-# no command runner involved)
-# ---------------------------------------------------------------------------
-
-
-def test_fs_invalid_workdir(fleetctl):
-    script = fleetctl.parse_text(
-        "#!/bin/bash\n"
-        "#SBATCH --partition=medium\n"
-        "cd /definitely/not/a/real/path\n"
-        "python3 task.py\n"
-    )
-    rep = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep)
-    fs1 = [d for d in rep.items if d.rule_id == "FS001"]
-    assert fs1 and fs1[0].level == "INFO"
-    assert fs1[0].line is not None
-
-
-def test_fs003_output_dir_missing(fleetctl, tmp_path):
-    script_path = tmp_path / "job.sbatch"
-    script_path.write_text(
-        "#!/bin/bash\n#SBATCH --output=out/%x_%j.log\n#SBATCH --partition=medium\necho hi\n"
-    )
-    script = fleetctl.parse_script(script_path)
-    rep = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep)
-    fs3 = [d for d in rep.items if d.rule_id == "FS003"]
-    assert fs3 and fs3[0].level == "INFO"
-    (tmp_path / "out").mkdir()
-    rep2 = fleetctl.Report()
-    fleetctl.check_filesystem(script, rep2)
-    assert not [d for d in rep2.items if d.rule_id == "FS003"]
-
-
-# ---------------------------------------------------------------------------
 # _CommandRunner -- the real subprocess facade, exercised for real (no
 # stubbing here on purpose: this is the one place we *want* to prove a
 # missing binary becomes a diagnostic rather than a crash).
@@ -249,3 +163,31 @@ def test_exit_code_truth_table(fleetctl):
     errored.warn("X001", "careful")
     errored.error("X002", "no")
     assert errored.exit_code() == 2
+
+
+# -- secret backends: only `file` and `pass` exist ----------------------------
+
+
+@pytest.mark.parametrize("backend", ["command", "inline"])
+def test_removed_secret_backend_is_refused_with_the_supported_list(
+    fleetctl, tmp_path, backend
+):
+    (tmp_path / "t.toml").write_text(
+        f'version = 1\nname = "t"\nprotocol = "direct"\nsecret_backend = "{backend}"\n'
+        'secret_ref = "x"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(fleetctl.FleetError) as caught:
+        fleetctl.load_targets(tmp_path)
+    message = str(caught.value)
+    assert backend in message
+    assert "'file'" in message and "'pass'" in message
+
+
+def test_inline_secret_table_is_an_unknown_target_key(fleetctl, tmp_path):
+    (tmp_path / "t.toml").write_text(
+        'version = 1\nname = "t"\nprotocol = "direct"\n[secret]\nhost = "h"\nuser = "u"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(fleetctl.FleetError, match="unrecognised"):
+        fleetctl.load_targets(tmp_path)

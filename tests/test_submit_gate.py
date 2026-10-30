@@ -160,12 +160,6 @@ def test_queue_without_its_required_account_is_refused(fleetctl_path, sandbox, p
     assert "KIAC020" in proc.stderr
 
 
-def test_wrapper_paths_are_not_reported_as_the_operators(fleetctl_path, sandbox, payload):
-    """`cd /home/nobody` and the staged script path are fleetctl's own lines."""
-    proc = submit(fleetctl_path, sandbox, payload, "--queue", "a100")
-    assert "FS001" not in proc.stderr and "FS002" not in proc.stderr
-
-
 @pytest.mark.parametrize("json_flag", [False, True])
 def test_slurm_profile_cannot_run_script_directly_on_login(
     fleetctl_path, sandbox, payload, json_flag
@@ -208,8 +202,6 @@ def cluster_path_job(tmp_path):
 def test_native_job_with_cluster_paths_is_submitted(fleetctl_path, sandbox, cluster_path_job):
     proc = submit(fleetctl_path, sandbox, cluster_path_job, "--native-batch")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    for rule in ("FS001", "FS002", "FS003"):
-        assert f"INFO  {rule}" in proc.stderr
 
 
 def test_strict_does_not_turn_path_hints_into_refusals(

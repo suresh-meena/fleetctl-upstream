@@ -123,6 +123,5 @@ is exactly one JSON object, errors included.
 ## Operating fleetqd
 
 Upgrades, restores, tokens and target onboarding are in `fleetq/README.md`
-and `fleetq/OPERATIONS.md` in the dotfiles repo. Every target starts disabled
-and needs reviewed evidence before it is enabled; never enable one to get a
-job running.
+and `fleetq/OPERATIONS.md` in the dotfiles repo. Every target starts disabled;
+never enable one to get a job running.

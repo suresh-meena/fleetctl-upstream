@@ -237,11 +237,11 @@ Poll at the site's approved cadence and within the configured control budget.
 Never loop `squeue`, `sacct` or `fleetctl job status` to chase a faster
 response.
 
-- On a site with a `[control_budget]`, every control call spends a token.
-  Exit 75 means the bucket is empty: wait the `retry_after` it reports (under
-  `--json`, in `details.retry_after`) or pass `--budget-wait <seconds>`; never
-  retry in a loop. Say what a read-only scheduler query is with `fleetctl exec
-  --admin --op-class monitor -- squeue ...`.
+- On a site with a `[control_budget]`, every control call asks the central
+  authority for a permit. Exit 75 means it was denied (or unreachable): wait the
+  `retry_after` it reports, when it gives one (under `--json`, in
+  `details.retry_after`); never retry in a loop. Say what a read-only scheduler
+  query is with `fleetctl exec --admin --op-class monitor -- squeue ...`.
 - `--json` on `exec`, `script`, `sync`, `submit` and `job status|cancel` prints
   one `fleetctl.result/v1` document. Branch on `outcome` and
   `may_have_executed`, not on exit codes. When a `submit` says
@@ -265,9 +265,6 @@ When the user wants to bring hosts into the fleet:
 - Declare how a host is reached on the target itself, direct first:
   `reach = ["direct", "via:<bridge>"]`. Never hide a hop in a secret or in
   `~/.ssh/config`.
-- For a host whose address changes on every start, use
-  `secret_backend = "command"` with `secret_ref` naming a script that prints
-  `host = "..."`. Its output is a secret: never echo it back to the user.
 - Seed the current live fleet into pass with `fleetctl seed-pass`, then rebuild
   the generated tree with `fleetctl deploy-config`.
 - When the dotfiles repo is the source of the operator surface, prefer the
@@ -279,8 +276,8 @@ When the user wants to bring hosts into the fleet:
   `workdir/<project-name>` on some hosts, use repeated
   `--target-root target=/remote/path` entries on the project binding.
 - A host added to fleetctl is not yet monitored or schedulable. Fleetmon needs
-  its helper (`scripts/install-helper`), and fleetqd needs an enabled `[[node]]`
-  with reviewed evidence. Both are deliberate, per-target steps; see
+  its helper (`scripts/install-helper`), and fleetqd needs an enabled `[[node]]`.
+  Both are deliberate, per-target steps; see
   [references/fleetmon.md](references/fleetmon.md) and
   [references/fq.md](references/fq.md).
 
@@ -300,8 +297,8 @@ When the user wants to bring hosts into the fleet:
   A Slurm profile's `submit_command` must call `sbatch` directly and pass
   `{script}` exactly once as its final argument; a wrapper could run work on the
   login node before Slurm receives it. There is no second runtime dimension: a
-  protocol's `job_runtime` no longer exists, and a config still carrying it is
-  reported by `doctor` and stripped by `fleetctl migrate-config`.
+  protocol's `job_runtime` no longer exists, and a config still carrying it
+  fails to load as an unknown key.
 - Ask the whole fleet a read-only question with `--all` or `--tag <tag>`, and
   `--jobs <n>` to overlap them: `fleetctl smoke --all --jobs 4`. Only `smoke`,
   `exec` and `job status` fan out; `sync`, `submit`, `script` and `job

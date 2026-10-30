@@ -117,6 +117,18 @@ def test_parse_time():
     assert fleetctl.parse_time("infinite") == -1
     assert fleetctl.parse_time("junk") is None
     assert fleetctl.parse_time("1:2:3:4") is None
+
+
+def test_parse_time_day_prefix_shifts_short_forms():
+    """With a day prefix Slurm reads D-HH and D-HH:MM, not MM and MM:SS."""
+    assert fleetctl.parse_time("1-12") == 129600
+    assert fleetctl.parse_time("1-12:30") == 129600 + 30 * 60
+    assert fleetctl.parse_time("1-12:30:15") == 129600 + 30 * 60 + 15
+    assert fleetctl.parse_time("0-01") == 3600
+    # Without a day prefix the existing readings are unchanged.
+    assert fleetctl.parse_time("90") == 90 * 60
+    assert fleetctl.parse_time("10:30") == 10 * 60 + 30
+    assert fleetctl.parse_time("1:02:03") == 3723
     assert fleetctl.parse_time("") is None
     assert fleetctl.parse_time(None) is None
 
@@ -149,6 +161,17 @@ def test_expand_hostlist():
     assert fleetctl.expand_hostlist("cn[01-03]") == ["cn01", "cn02", "cn03"]
 
 
+def test_expand_hostlist_commas_suffix_and_groups():
+    expand = fleetctl.expand_hostlist
+    assert expand("cn7,cn9") == ["cn7", "cn9"]
+    assert expand("cn[1-2],gpu3,x[05-06]") == ["cn1", "cn2", "gpu3", "x05", "x06"]
+    assert expand("cn[1,4]-ib") == ["cn1-ib", "cn4-ib"]
+    assert expand("cn[08-10]b") == ["cn08b", "cn09b", "cn10b"]
+    # several bracket groups in one name expand as a cartesian product
+    assert expand("a[1-2]b[3-4]") == ["a1b3", "a1b4", "a2b3", "a2b4"]
+    assert expand(" cn1 , cn2 ") == ["cn1", "cn2"]
+
+
 def test_short_to_long_mapping_is_complete_for_common_options():
     """Regression pin: the short-option table this rewrite carried over."""
     assert fleetctl.SHORT_TO_LONG["p"] == "--partition"
@@ -171,6 +194,17 @@ def test_valid_gpu_and_node_info_directives_are_not_refused(fleetctl, directive)
     fleetctl.check_generic(script, rep)
     assert not [d for d in rep.items if d.level == "ERROR"], directive
     assert "SLURM001" not in rep.rule_ids(), directive
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["propagate=NONE", "thread-spec=2", "wait-all-nodes=1", "use-min-nodes", "container=/img.sqsh"],
+)
+def test_real_sbatch_long_options_are_not_flagged_as_typos(fleetctl, option):
+    script = fleetctl.parse_text(f"#!/bin/bash\n#SBATCH --{option}\necho hi\n")
+    rep = fleetctl.Report()
+    fleetctl.check_generic(script, rep)
+    assert "SLURM001" not in rep.rule_ids(), option
 
 
 def test_an_invalid_spec_inside_a_gres_list_is_still_refused(fleetctl):

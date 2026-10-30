@@ -21,7 +21,7 @@ def fixture(name: str) -> Path:
 
 class FakeRunner:
     """Command runner stub matching the `.run(cmd) -> (rc, out)` protocol that
-    check_shell/check_modules/preflight_script expect from `_CommandRunner`.
+    check_shell/preflight_script expect from `_CommandRunner`.
 
     Responses are keyed by a command *prefix* tuple, so
     `FakeRunner({("bash", "-n"): (0, "")})` answers any `["bash", "-n", path]`

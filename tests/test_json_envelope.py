@@ -72,7 +72,7 @@ def test_classify_exception_after_sent_is_may_have_executed(fleetctl):
 def test_classify_exception_budget_refused_is_its_own_outcome_even_after_sent(fleetctl):
     attempt = fleetctl.Attempt()
     attempt.sent = True  # should not matter: BudgetRefused always wins
-    exc = fleetctl.BudgetRefused("no tokens", scope="local", retry_after=5.0)
+    exc = fleetctl.BudgetRefused("no tokens", scope="central", retry_after=5.0)
     outcome, executed = fleetctl.classify_exception(attempt, exc)
     assert (outcome, executed) == ("budget_refused", False)
 
